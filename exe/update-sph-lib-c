@@ -1,0 +1,18 @@
+#!/bin/sh
+
+sph_c_root="$1"
+destination="$PWD/src/foreign/trout/sph"
+
+if test -d "$destination"
+then
+  rm "$destination"/*
+else
+  mkdir -p "$destination"
+fi
+
+cd "$sph_c_root/src/sph"
+
+cp queue.h queue.c thread-pool.h thread-pool.c "$destination"
+
+# replace include paths in copied files
+sed -i 's@#include <sph/@#include <trout/sph/@g' "$destination"/*
