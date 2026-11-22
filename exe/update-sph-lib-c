@@ -14,5 +14,10 @@ cd "$sph_c_root/src/sph"
 
 cp queue.h queue.c thread-pool.h thread-pool.c "$destination"
 
+# only for testing
+cp test.h "$destination"
+
 # replace include paths in copied files
-sed -i 's@#include <sph/@#include <trout/sph/@g' "$destination"/*
+sed -i 's@#include <sph/@#include <trout/sph/@g' \
+  "$destination/queue.c" "$destination/queue.h" \
+  "$destination/thread-pool.c" "$destination/thread-pool.h"

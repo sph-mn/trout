@@ -18,9 +18,9 @@
 #define trout_thumbnail_kind_raw 2
 #define trout_thumbnail_kind_video 3
 #define trout_thumbnail_task_scan 4
-#define trout_thumbnail_jpeg_quality 11
-#define trout_thumbnail_update_batch_size 100
-#define trout_thumbnail_update_delay_milliseconds 2000
+#define trout_thumbnail_jpeg_quality 13
+#define trout_thumbnail_update_batch_size 400
+#define trout_thumbnail_update_delay_milliseconds 100
 
 typedef struct trout_thumbnail_task trout_thumbnail_task;
 typedef struct trout_thumbnail_update trout_thumbnail_update;

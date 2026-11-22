@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <gtk/gtk.h>
@@ -5,6 +6,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <glib/gstdio.h>
+#include <spawn.h>
 #include <string.h>
 #include "thumbnailer.h"
 
@@ -28,12 +30,16 @@
 #define trout_typeahead_timeout_milliseconds 5000
 #define trout_file_operation_copy 1
 #define trout_file_operation_move 2
+#define trout_sort_name 0
+#define trout_sort_modified 1
+#define trout_sort_size 2
 #define trout_application_id "org.trout.file-manager"
 #define trout_compact_css \
   "gridview.trout_compact { padding: 3px; border-spacing: 6px 0; }" \
   "gridview.trout_compact > child, gridview.trout_compact > child box { min-height: 0; margin: 0; padding: 0; border-width: 0; border-spacing: 0; }" \
-  "gridview.trout_compact label { font-size: " trout_filename_font_css "; min-height: 0; margin: 0; padding: 0; }"
-#define trout_directory_attributes "standard::name,standard::display-name,standard::type,standard::icon,standard::fast-content-type,standard::is-hidden"
+  "gridview.trout_compact label { font-size: " trout_filename_font_css "; min-height: 0; margin: 0; padding: 0; }" \
+  ".trout_location_buttons button, .trout_action_buttons button { font-size: " trout_filename_font_css "; }"
+#define trout_directory_attributes "standard::name,standard::display-name,standard::type,standard::icon,standard::fast-content-type,standard::is-hidden,standard::size,time::modified,time::modified-usec"
 
 typedef struct trout_window trout_window;
 typedef struct trout_tab trout_tab;
@@ -42,6 +48,9 @@ typedef struct trout_clipboard_read trout_clipboard_read;
 typedef struct trout_rename_dialog trout_rename_dialog;
 typedef struct trout_preferences trout_preferences;
 typedef struct trout_action trout_action;
+typedef struct trout_transfer_request trout_transfer_request;
+typedef struct trout_deferred_operation trout_deferred_operation;
+typedef struct trout_file_progress_update trout_file_progress_update;
 
 struct trout_preferences {
   guint zoom_level;
@@ -62,9 +71,21 @@ struct trout_window {
   GtkApplication *application;
   GtkWidget *window;
   GtkWidget *notebook;
+  GtkWidget *location_box;
   GtkWidget *custom_action_box;
   GtkWidget *hidden_button;
   GtkWidget *action_popover;
+  GtkWidget *sort_name_button;
+  GtkWidget *sort_modified_button;
+  GtkWidget *sort_size_button;
+  gboolean updating_sort_menu;
+  GtkWidget *transfer_dialog;
+  GtkWidget *transfer_label;
+  GtkWidget *transfer_progress;
+  GtkWidget *transfer_pause_button;
+  GtkWidget *transfer_cancel_button;
+  GQueue transfer_queue;
+  trout_transfer_request *active_transfer;
   GdkClipboard *clipboard;
   trout_thumbnailer *thumbnailer;
 };
@@ -90,6 +111,7 @@ struct trout_tab {
   gboolean context_file_is_directory;
   guint zoom_level;
   guint icon_size;
+  guint sort_order;
   guint typeahead_timeout_id;
   GString *typeahead_prefix;
   gboolean completion_has_suffix;
@@ -107,9 +129,43 @@ struct trout_file_job {
   guint operation;
   gboolean delete_enumeration_done;
   gboolean delete_failed;
+  trout_transfer_request *transfer_request;
+};
+
+struct trout_transfer_request {
+  trout_window *window;
+  GtkWidget *window_widget;
+  GtkWidget *status_label;
+  GPtrArray *sources;
+  GPtrArray *destinations;
+  GQueue deferred_operations;
+  GCancellable *cancellable;
+  GMutex pause_mutex;
+  GCond pause_condition;
+  guint operation;
+  guint pending;
+  gint references;
+  gboolean starting;
+  gboolean paused;
+  char *current_name;
+};
+
+struct trout_deferred_operation {
+  GFile *source;
+  GFile *destination;
+  guint operation;
+};
+
+struct trout_file_progress_update {
+  trout_transfer_request *request;
+  char *name;
+  goffset current_bytes;
+  goffset total_bytes;
 };
 
 struct trout_clipboard_read {
+  trout_window *window;
+  GtkWidget *window_widget;
   GInputStream *stream;
   GByteArray *bytes;
   GFile *destination;
@@ -133,7 +189,11 @@ void trout_tab_complete_location(trout_tab *tab, gboolean highlight);
 void trout_window_update_custom_actions(trout_window *window);
 gboolean trout_action_matches_selection(trout_action *action, trout_tab *tab);
 void trout_action_activate(GtkButton *button, gpointer user_data);
+void trout_action_child_exited(GPid process_id, gint wait_status, gpointer user_data);
 GtkWidget *trout_action_make_button(trout_action *action, trout_window *window, GtkWidget *popover);
+void trout_window_sort_toggled(GtkCheckButton *button, gpointer user_data);
+void trout_window_update_sort_menu(trout_window *window, trout_tab *tab);
+void trout_tab_set_sort_order(trout_tab *tab, guint sort_order);
 void trout_window_add_tab(trout_window *window, GFile *directory);
 GtkWidget *trout_window_create(GtkApplication *application, GFile *directory);
 GtkWidget *trout_tab_create(trout_window *window, GFile *directory);
@@ -154,6 +214,7 @@ void trout_tab_on_location_changed(GtkEditable *editable, gpointer user_data);
 void trout_tab_on_location_position_changed(GObject *object, GParamSpec *property, gpointer user_data);
 void trout_tab_on_completion_data(GFilenameCompleter *completer, gpointer user_data);
 void trout_tab_on_entry_context_pressed(GtkGestureClick *gesture, gint press_count, double x, double y, gpointer user_data);
+void trout_tab_on_entry_pressed(GtkGestureClick *gesture, gint press_count, double x, double y, gpointer user_data);
 void trout_tab_context_action(GtkButton *button, gpointer user_data);
 void trout_tab_context_closed(GtkPopover *popover, gpointer user_data);
 void trout_tab_copy_selection(trout_tab *tab, gboolean cut);
@@ -161,9 +222,24 @@ void trout_tab_paste(trout_tab *tab);
 void trout_tab_rename_context_file(trout_tab *tab);
 void trout_tab_delete_selection(trout_tab *tab);
 void trout_tab_show_error(GtkWidget *status_label, GError *error);
-void trout_tab_start_file_operation(GtkWidget *status_label, GFile *source, GFile *destination, guint operation);
+void trout_tab_start_file_operation(GtkWidget *status_label, GFile *source, GFile *destination, guint operation, trout_transfer_request *request);
 void trout_tab_file_job_destroy(trout_file_job *job);
 void trout_tab_file_operation_complete(GObject *source, GAsyncResult *result, gpointer user_data);
+void trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GPtrArray *sources, GPtrArray *destinations, guint operation);
+void trout_transfer_request_start_next(trout_window *window);
+void trout_transfer_request_finish(trout_transfer_request *request);
+void trout_transfer_request_destroy(trout_transfer_request *request);
+trout_transfer_request *trout_transfer_request_ref(trout_transfer_request *request);
+void trout_transfer_request_release_pause(trout_transfer_request *request);
+void trout_transfer_request_resume_deferred(trout_transfer_request *request);
+void trout_transfer_request_discard_deferred(trout_transfer_request *request);
+void trout_transfer_request_update_label(trout_transfer_request *request);
+void trout_transfer_pause(GtkButton *button, gpointer user_data);
+void trout_transfer_cancel(GtkButton *button, gpointer user_data);
+void trout_file_operation_progress(goffset current_bytes, goffset total_bytes, gpointer user_data);
+gboolean trout_file_operation_progress_update(gpointer user_data);
+void trout_file_operation_progress_update_destroy(gpointer user_data);
+void trout_file_operation_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable);
 void trout_tab_start_delete_operation(GtkWidget *status_label, GFile *source, trout_file_job *parent);
 void trout_tab_delete_operation_complete(GObject *source, GAsyncResult *result, gpointer user_data);
 void trout_tab_delete_directory_enumerated(GObject *source, GAsyncResult *result, gpointer user_data);
@@ -180,6 +256,7 @@ void trout_tab_rename_accept(GtkWidget *widget, gpointer user_data);
 void trout_tab_rename_cancel(GtkButton *button, gpointer user_data);
 void trout_tab_rename_dialog_destroy(gpointer user_data);
 void trout_tab_on_background_pressed(GtkGestureClick *gesture, gint press_count, double x, double y, gpointer user_data);
+void trout_tab_on_background_context_pressed(GtkGestureClick *gesture, gint press_count, double x, double y, gpointer user_data);
 gboolean trout_window_on_key(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer user_data);
 gboolean trout_tab_on_scroll(GtkEventControllerScroll *controller, double delta_x, double delta_y, gpointer user_data);
 guint trout_zoom_icon_size(guint zoom_level);
@@ -471,14 +548,18 @@ trout_action_activate(GtkButton *button, gpointer user_data)
   GtkBitsetIter iterator;
   GFileInfo *file_info;
   GFile *file;
-  GError *error;
   char **arguments;
   char **command_argument;
+  char **environment;
   char *path;
+  char *working_directory;
   guint command_count;
   guint selected_count;
   guint argument_index;
   guint position;
+  pid_t process_id;
+  posix_spawn_file_actions_t spawn_actions;
+  int spawn_status;
   gboolean path_error;
   window = user_data;
   tab = g_object_get_data(G_OBJECT(button), "trout_custom_tab");
@@ -486,6 +567,7 @@ trout_action_activate(GtkButton *button, gpointer user_data)
   action = g_object_get_data(G_OBJECT(button), "trout_custom_action");
   popover = g_object_get_data(G_OBJECT(button), "trout_custom_popover");
   if (tab != 0 && trout_action_matches_selection(action, tab)) {
+    working_directory = g_file_get_path(tab->directory);
     selected = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
     selected_count = gtk_bitset_get_size(selected);
     command_count = g_strv_length(action->command);
@@ -514,16 +596,33 @@ trout_action_activate(GtkButton *button, gpointer user_data)
       if (!path_error && !gtk_bitset_iter_next(&iterator, &position)) break;
     }
     if (!path_error) {
-      error = 0;
-      if (!g_spawn_async(0, arguments, 0, G_SPAWN_SEARCH_PATH, 0, 0, 0, &error)) {
-        trout_tab_show_error(tab->status_label, error);
-        g_error_free(error);
+      environment = g_get_environ();
+      spawn_status = posix_spawn_file_actions_init(&spawn_actions);
+      if (spawn_status == 0) {
+        spawn_status = posix_spawn_file_actions_addchdir_np(&spawn_actions, working_directory);
+        if (spawn_status == 0) spawn_status = posix_spawnp(&process_id, arguments[0], &spawn_actions, 0, arguments, environment);
+        posix_spawn_file_actions_destroy(&spawn_actions);
+      }
+      g_strfreev(environment);
+      if (spawn_status != 0) {
+        gtk_label_set_text(GTK_LABEL(tab->status_label), g_strerror(spawn_status));
+      } else {
+        g_child_watch_add(process_id, trout_action_child_exited, 0);
       }
     }
+    g_free(working_directory);
     g_strfreev(arguments);
     gtk_bitset_unref(selected);
   }
   if (popover != 0) gtk_popover_popdown(GTK_POPOVER(popover));
+}
+
+void
+trout_action_child_exited(GPid process_id, gint wait_status, gpointer user_data)
+{
+  g_spawn_close_pid(process_id);
+  (void)wait_status;
+  (void)user_data;
 }
 
 gboolean
@@ -547,22 +646,65 @@ trout_file_sort_name(GFileInfo *file_info, gpointer user_data)
   return g_strdup(g_file_info_get_display_name(file_info));
 }
 
+guint64
+trout_file_sort_modified(GFileInfo *file_info, gpointer user_data)
+{
+  guint64 modified;
+  guint32 modified_microseconds;
+  (void)user_data;
+  modified = g_file_info_get_attribute_uint64(file_info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
+  modified_microseconds = g_file_info_get_attribute_uint32(file_info, G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC);
+  return modified * G_USEC_PER_SEC + modified_microseconds;
+}
+
+gint64
+trout_file_sort_size(GFileInfo *file_info, gpointer user_data)
+{
+  (void)user_data;
+  return g_file_info_get_size(file_info);
+}
+
 GtkSorter *
-trout_create_file_sorter(void)
+trout_create_file_sorter(guint sort_order)
 {
   GtkMultiSorter *sorter;
   GtkExpression *group_expression;
-  GtkExpression *name_expression;
+  GtkExpression *sort_expression;
   GtkStringSorter *name_sorter;
+  GtkNumericSorter *numeric_sorter;
   sorter = gtk_multi_sorter_new();
   group_expression = gtk_cclosure_expression_new(G_TYPE_INT, 0, 0, 0, G_CALLBACK(trout_file_sort_group), 0, 0);
   gtk_multi_sorter_append(sorter, GTK_SORTER(gtk_numeric_sorter_new(group_expression)));
-  name_expression = gtk_cclosure_expression_new(G_TYPE_STRING, 0, 0, 0, G_CALLBACK(trout_file_sort_name), 0, 0);
-  name_sorter = gtk_string_sorter_new(name_expression);
-  gtk_string_sorter_set_ignore_case(name_sorter, FALSE);
-  gtk_string_sorter_set_collation(name_sorter, GTK_COLLATION_UNICODE);
-  gtk_multi_sorter_append(sorter, GTK_SORTER(name_sorter));
+  if (sort_order == trout_sort_modified) sort_expression = gtk_cclosure_expression_new(G_TYPE_UINT64, 0, 0, 0, G_CALLBACK(trout_file_sort_modified), 0, 0);
+  else if (sort_order == trout_sort_size) sort_expression = gtk_cclosure_expression_new(G_TYPE_INT64, 0, 0, 0, G_CALLBACK(trout_file_sort_size), 0, 0);
+  else sort_expression = gtk_cclosure_expression_new(G_TYPE_STRING, 0, 0, 0, G_CALLBACK(trout_file_sort_name), 0, 0);
+  if (sort_order == trout_sort_name) {
+    name_sorter = gtk_string_sorter_new(sort_expression);
+    gtk_string_sorter_set_ignore_case(name_sorter, FALSE);
+    gtk_string_sorter_set_collation(name_sorter, GTK_COLLATION_UNICODE);
+    gtk_multi_sorter_append(sorter, GTK_SORTER(name_sorter));
+  } else {
+    numeric_sorter = gtk_numeric_sorter_new(sort_expression);
+    gtk_numeric_sorter_set_sort_order(numeric_sorter, GTK_SORT_DESCENDING);
+    gtk_multi_sorter_append(sorter, GTK_SORTER(numeric_sorter));
+    name_sorter = gtk_string_sorter_new(gtk_cclosure_expression_new(G_TYPE_STRING, 0, 0, 0, G_CALLBACK(trout_file_sort_name), 0, 0));
+    gtk_string_sorter_set_ignore_case(name_sorter, FALSE);
+    gtk_string_sorter_set_collation(name_sorter, GTK_COLLATION_UNICODE);
+    gtk_multi_sorter_append(sorter, GTK_SORTER(name_sorter));
+  }
   return GTK_SORTER(sorter);
+}
+
+void
+trout_tab_set_sort_order(trout_tab *tab, guint sort_order)
+{
+  GtkSorter *sorter;
+  if (tab->sort_order != sort_order) {
+    tab->sort_order = sort_order;
+    sorter = trout_create_file_sorter(sort_order);
+    gtk_sort_list_model_set_sorter(tab->sorted_list, sorter);
+    g_object_unref(sorter);
+  }
 }
 
 void
@@ -731,8 +873,7 @@ trout_tab_update_location(trout_tab *tab)
     gtk_box_append(GTK_BOX(tab->path_buttons), button);
   }
   button = gtk_button_new();
-  gtk_widget_set_hexpand(button, TRUE);
-  gtk_widget_set_halign(button, GTK_ALIGN_FILL);
+  gtk_widget_set_size_request(button, 50, -1);
   g_signal_connect(button, "clicked", G_CALLBACK(trout_tab_on_edit_location), tab);
   gtk_box_append(GTK_BOX(tab->path_buttons), button);
   gtk_stack_set_visible_child_name(GTK_STACK(tab->location_stack), "buttons");
@@ -753,6 +894,7 @@ trout_tab_set_directory(trout_tab *tab, GFile *directory)
   tab->directory = g_object_ref(directory);
   gtk_directory_list_set_file(tab->directory_list, directory);
   trout_tab_update_location(tab);
+  gtk_widget_grab_focus(tab->grid);
   trout_tab_update_status(tab);
   if (trout_window_get_current_tab(tab->window) == tab) trout_window_update_custom_actions(tab->window);
 }
@@ -923,6 +1065,7 @@ trout_tab_factory_setup(GtkSignalListItemFactory *factory, GtkListItem *list_ite
   GtkWidget *picture;
   GtkWidget *label;
   GtkGesture *context_click;
+  GtkGesture *primary_click;
   (void)factory;
   tab = user_data;
   row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, trout_icon_label_spacing);
@@ -953,6 +1096,11 @@ trout_tab_factory_setup(GtkSignalListItemFactory *factory, GtkListItem *list_ite
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(context_click), GDK_BUTTON_SECONDARY);
   g_signal_connect(context_click, "pressed", G_CALLBACK(trout_tab_on_entry_context_pressed), tab);
   gtk_widget_add_controller(row, GTK_EVENT_CONTROLLER(context_click));
+  primary_click = gtk_gesture_click_new();
+  gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(primary_click), GTK_PHASE_CAPTURE);
+  gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(primary_click), GDK_BUTTON_PRIMARY);
+  g_signal_connect(primary_click, "pressed", G_CALLBACK(trout_tab_on_entry_pressed), tab);
+  gtk_widget_add_controller(row, GTK_EVENT_CONTROLLER(primary_click));
   gtk_list_item_set_child(list_item, row);
 }
 
@@ -1009,26 +1157,54 @@ trout_tab_show_error(GtkWidget *status_label, GError *error)
 }
 
 void
-trout_tab_start_file_operation(GtkWidget *status_label, GFile *source, GFile *destination, guint operation)
+trout_tab_start_file_operation(GtkWidget *status_label, GFile *source, GFile *destination, guint operation, trout_transfer_request *request)
 {
   trout_file_job *job;
+  trout_deferred_operation *deferred;
+  GTask *task;
+  if (request->paused) {
+    deferred = g_new0(trout_deferred_operation, 1);
+    deferred->source = g_object_ref(source);
+    deferred->destination = g_object_ref(destination);
+    deferred->operation = operation;
+    request->pending += 1;
+    g_queue_push_tail(&request->deferred_operations, deferred);
+    return;
+  }
   job = g_new0(trout_file_job, 1);
   job->status_label = g_object_ref(status_label);
   job->source = g_object_ref(source);
   if (destination != 0) job->destination = g_object_ref(destination);
   job->operation = operation;
-  if (operation == trout_file_operation_copy) g_file_copy_async(source, destination, G_FILE_COPY_NONE, G_PRIORITY_DEFAULT, 0, 0, 0, trout_tab_file_operation_complete, job);
-  else g_file_move_async(source, destination, G_FILE_COPY_NONE, G_PRIORITY_DEFAULT, 0, 0, 0, trout_tab_file_operation_complete, job);
+  job->transfer_request = request;
+  request->pending += 1;
+  if (g_cancellable_is_cancelled(request->cancellable)) {
+    trout_tab_file_job_destroy(job);
+    return;
+  }
+  g_free(request->current_name);
+  request->current_name = g_file_get_basename(source);
+  trout_transfer_request_update_label(request);
+  task = g_task_new(source, request->cancellable, trout_tab_file_operation_complete, job);
+  g_task_set_task_data(task, job, 0);
+  g_task_run_in_thread(task, trout_file_operation_worker);
+  g_object_unref(task);
 }
 
 void
 trout_tab_file_job_destroy(trout_file_job *job)
 {
+  trout_transfer_request *request;
+  request = job->transfer_request;
   g_object_unref(job->status_label);
   g_object_unref(job->source);
   if (job->destination != 0) g_object_unref(job->destination);
   if (job->enumerator != 0) g_object_unref(job->enumerator);
   g_free(job);
+  if (request != 0) {
+    request->pending -= 1;
+    if (request->pending == 0 && !request->starting) trout_transfer_request_finish(request);
+  }
 }
 
 void
@@ -1039,19 +1215,316 @@ trout_tab_file_operation_complete(GObject *source, GAsyncResult *result, gpointe
   gboolean succeeded;
   job = user_data;
   error = 0;
+  succeeded = g_task_propagate_boolean(G_TASK(result), &error);
   if (job->operation == trout_file_operation_copy) {
-    succeeded = g_file_copy_finish(G_FILE(source), result, &error);
     if (!succeeded && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_RECURSE)) {
       g_error_free(error);
-      g_file_make_directory_async(job->destination, G_PRIORITY_DEFAULT, 0, trout_tab_copy_directory_created, job);
+      if (g_file_has_prefix(job->destination, job->source)) {
+        gtk_label_set_text(GTK_LABEL(job->status_label), "Cannot copy a directory into itself or one of its subdirectories");
+        trout_tab_file_job_destroy(job);
+        return;
+      }
+      g_file_make_directory_async(job->destination, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_created, job);
       return;
     }
-  } else succeeded = g_file_move_finish(G_FILE(source), result, &error);
-  if (!succeeded && error != 0) {
+  }
+  if (!succeeded && error != 0 && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
     trout_tab_show_error(job->status_label, error);
     g_error_free(error);
   }
   trout_tab_file_job_destroy(job);
+  (void)source;
+}
+
+void
+trout_transfer_request_destroy(trout_transfer_request *request)
+{
+  if (g_atomic_int_dec_and_test(&request->references)) {
+    g_object_unref(request->window_widget);
+    g_object_unref(request->status_label);
+    g_ptr_array_unref(request->sources);
+    g_ptr_array_unref(request->destinations);
+    g_free(request->current_name);
+    g_object_unref(request->cancellable);
+    g_cond_clear(&request->pause_condition);
+    g_mutex_clear(&request->pause_mutex);
+    g_free(request);
+  }
+}
+
+trout_transfer_request *
+trout_transfer_request_ref(trout_transfer_request *request)
+{
+  g_atomic_int_inc(&request->references);
+  return request;
+}
+
+void
+trout_transfer_request_release_pause(trout_transfer_request *request)
+{
+  g_mutex_lock(&request->pause_mutex);
+  request->paused = FALSE;
+  g_cond_broadcast(&request->pause_condition);
+  g_mutex_unlock(&request->pause_mutex);
+}
+
+void
+trout_transfer_request_resume_deferred(trout_transfer_request *request)
+{
+  trout_deferred_operation *deferred;
+  while (!g_queue_is_empty(&request->deferred_operations)) {
+    deferred = g_queue_pop_head(&request->deferred_operations);
+    request->pending -= 1;
+    trout_tab_start_file_operation(request->status_label, deferred->source, deferred->destination, deferred->operation, request);
+    g_object_unref(deferred->source);
+    g_object_unref(deferred->destination);
+    g_free(deferred);
+  }
+  if (request->pending == 0 && !request->starting) trout_transfer_request_finish(request);
+}
+
+void
+trout_transfer_request_discard_deferred(trout_transfer_request *request)
+{
+  trout_deferred_operation *deferred;
+  while (!g_queue_is_empty(&request->deferred_operations)) {
+    deferred = g_queue_pop_head(&request->deferred_operations);
+    request->pending -= 1;
+    g_object_unref(deferred->source);
+    g_object_unref(deferred->destination);
+    g_free(deferred);
+  }
+  if (request->pending == 0 && !request->starting) trout_transfer_request_finish(request);
+}
+
+void
+trout_transfer_request_update_label(trout_transfer_request *request)
+{
+  guint queued_count;
+  char *text;
+  queued_count = g_queue_get_length(&request->window->transfer_queue);
+  if (request->paused) {
+    if (queued_count > 0) text = g_strdup_printf("Paused: %s %s · %u queued", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files", queued_count);
+    else text = g_strdup_printf("Paused: %s %s", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files");
+  } else if (queued_count > 0) text = g_strdup_printf("%s %s · %u queued", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files", queued_count);
+  else text = g_strdup_printf("%s %s", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files");
+  gtk_label_set_text(GTK_LABEL(request->window->transfer_label), text);
+  g_free(text);
+}
+
+void
+trout_transfer_request_finish(trout_transfer_request *request)
+{
+  trout_window *window;
+  GtkWidget *window_widget;
+  window = request->window;
+  if (window->active_transfer != request) return;
+  window_widget = g_object_ref(request->window_widget);
+  window->active_transfer = 0;
+  trout_transfer_request_destroy(request);
+  if (g_queue_is_empty(&window->transfer_queue)) {
+    gtk_window_destroy(GTK_WINDOW(window->transfer_dialog));
+    window->transfer_dialog = 0;
+    window->transfer_label = 0;
+    window->transfer_progress = 0;
+    window->transfer_pause_button = 0;
+    window->transfer_cancel_button = 0;
+  } else trout_transfer_request_start_next(window);
+  g_object_unref(window_widget);
+}
+
+void
+trout_transfer_request_start_next(trout_window *window)
+{
+  trout_transfer_request *request;
+  GFile *source;
+  GFile *destination;
+  guint index;
+  request = g_queue_pop_head(&window->transfer_queue);
+  window->active_transfer = request;
+  gtk_widget_set_sensitive(window->transfer_cancel_button, TRUE);
+  gtk_button_set_label(GTK_BUTTON(window->transfer_cancel_button), "Cancel");
+  gtk_widget_set_sensitive(window->transfer_pause_button, TRUE);
+  gtk_button_set_label(GTK_BUTTON(window->transfer_pause_button), "Pause");
+  gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(window->transfer_progress), 0.0);
+  trout_transfer_request_update_label(request);
+  request->starting = TRUE;
+  index = 0;
+  while (index < request->sources->len) {
+    source = g_ptr_array_index(request->sources, index);
+    destination = g_ptr_array_index(request->destinations, index);
+    trout_tab_start_file_operation(request->status_label, source, destination, request->operation, request);
+    index += 1;
+  }
+  request->starting = FALSE;
+  if (request->pending == 0) trout_transfer_request_finish(request);
+}
+
+void
+trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GPtrArray *sources, GPtrArray *destinations, guint operation)
+{
+  trout_transfer_request *request;
+  GtkWidget *content;
+  GtkWidget *buttons;
+  GtkWidget *pause_button;
+  GtkWidget *cancel_button;
+  if (sources->len == 0) {
+    g_ptr_array_unref(sources);
+    g_ptr_array_unref(destinations);
+    return;
+  }
+  request = g_new0(trout_transfer_request, 1);
+  request->window = window;
+  request->window_widget = g_object_ref(window->window);
+  request->status_label = g_object_ref(status_label);
+  request->sources = sources;
+  request->destinations = destinations;
+  request->operation = operation;
+  request->cancellable = g_cancellable_new();
+  request->references = 1;
+  g_queue_init(&request->deferred_operations);
+  g_mutex_init(&request->pause_mutex);
+  g_cond_init(&request->pause_condition);
+  g_queue_push_tail(&window->transfer_queue, request);
+  if (window->transfer_dialog == 0) {
+    window->transfer_dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(window->transfer_dialog), "File Operations");
+    gtk_window_set_transient_for(GTK_WINDOW(window->transfer_dialog), GTK_WINDOW(window->window));
+    gtk_window_set_default_size(GTK_WINDOW(window->transfer_dialog), 420, -1);
+    gtk_window_set_deletable(GTK_WINDOW(window->transfer_dialog), FALSE);
+    content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(content, 12);
+    gtk_widget_set_margin_end(content, 12);
+    gtk_widget_set_margin_top(content, 12);
+    gtk_widget_set_margin_bottom(content, 12);
+    window->transfer_label = gtk_label_new(0);
+    gtk_label_set_xalign(GTK_LABEL(window->transfer_label), 0.0f);
+    window->transfer_progress = gtk_progress_bar_new();
+    buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    pause_button = gtk_button_new_with_label("Pause");
+    window->transfer_pause_button = pause_button;
+    g_signal_connect(pause_button, "clicked", G_CALLBACK(trout_transfer_pause), window);
+    cancel_button = gtk_button_new_with_label("Cancel");
+    window->transfer_cancel_button = cancel_button;
+    g_signal_connect(cancel_button, "clicked", G_CALLBACK(trout_transfer_cancel), window);
+    gtk_box_append(GTK_BOX(content), window->transfer_label);
+    gtk_box_append(GTK_BOX(content), window->transfer_progress);
+    gtk_box_append(GTK_BOX(buttons), pause_button);
+    gtk_box_append(GTK_BOX(buttons), cancel_button);
+    gtk_box_append(GTK_BOX(content), buttons);
+    gtk_window_set_child(GTK_WINDOW(window->transfer_dialog), content);
+  }
+  gtk_window_present(GTK_WINDOW(window->transfer_dialog));
+  if (window->active_transfer == 0) trout_transfer_request_start_next(window);
+  else trout_transfer_request_update_label(window->active_transfer);
+}
+
+void
+trout_transfer_pause(GtkButton *button, gpointer user_data)
+{
+  trout_window *window;
+  trout_transfer_request *request;
+  gboolean paused;
+  window = user_data;
+  request = window->active_transfer;
+  if (request != 0) {
+    g_mutex_lock(&request->pause_mutex);
+    paused = request->paused;
+    request->paused = !paused;
+    g_cond_broadcast(&request->pause_condition);
+    g_mutex_unlock(&request->pause_mutex);
+    if (paused) {
+      gtk_button_set_label(button, "Pause");
+      trout_transfer_request_update_label(request);
+      trout_transfer_request_resume_deferred(request);
+    } else {
+      gtk_button_set_label(button, "Resume");
+      trout_transfer_request_update_label(request);
+    }
+  }
+}
+
+void
+trout_transfer_cancel(GtkButton *button, gpointer user_data)
+{
+  trout_window *window;
+  trout_transfer_request *request;
+  window = user_data;
+  request = window->active_transfer;
+  if (request != 0) {
+    gtk_button_set_label(button, "Cancelling…");
+    gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
+    gtk_widget_set_sensitive(window->transfer_pause_button, FALSE);
+    g_cancellable_cancel(request->cancellable);
+    trout_transfer_request_release_pause(request);
+    trout_transfer_request_discard_deferred(request);
+  }
+}
+
+void
+trout_file_operation_progress(goffset current_bytes, goffset total_bytes, gpointer user_data)
+{
+  trout_file_job *job;
+  trout_transfer_request *request;
+  trout_file_progress_update *update;
+  GSource *idle_source;
+  job = user_data;
+  request = job->transfer_request;
+  g_mutex_lock(&request->pause_mutex);
+  while (request->paused && !g_cancellable_is_cancelled(request->cancellable)) g_cond_wait(&request->pause_condition, &request->pause_mutex);
+  g_mutex_unlock(&request->pause_mutex);
+  if (g_cancellable_is_cancelled(request->cancellable)) return;
+  update = g_new0(trout_file_progress_update, 1);
+  update->request = trout_transfer_request_ref(request);
+  update->name = g_file_get_basename(job->source);
+  update->current_bytes = current_bytes;
+  update->total_bytes = total_bytes;
+  idle_source = g_idle_source_new();
+  g_source_set_callback(idle_source, trout_file_operation_progress_update, update, trout_file_operation_progress_update_destroy);
+  g_source_attach(idle_source, g_main_context_default());
+  g_source_unref(idle_source);
+}
+
+gboolean
+trout_file_operation_progress_update(gpointer user_data)
+{
+  trout_file_progress_update *update;
+  trout_transfer_request *request;
+  update = user_data;
+  request = update->request;
+  if (request->window->active_transfer == request) {
+    g_free(request->current_name);
+    request->current_name = g_strdup(update->name != 0 ? update->name : "file");
+    trout_transfer_request_update_label(request);
+    if (update->total_bytes > 0) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(request->window->transfer_progress), (double)update->current_bytes / update->total_bytes);
+    else gtk_progress_bar_pulse(GTK_PROGRESS_BAR(request->window->transfer_progress));
+  }
+  return FALSE;
+}
+
+void
+trout_file_operation_progress_update_destroy(gpointer user_data)
+{
+  trout_file_progress_update *update;
+  update = user_data;
+  trout_transfer_request_destroy(update->request);
+  g_free(update->name);
+  g_free(update);
+}
+
+void
+trout_file_operation_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+{
+  trout_file_job *job;
+  GError *error;
+  gboolean succeeded;
+  job = task_data;
+  error = 0;
+  if (job->operation == trout_file_operation_copy) succeeded = g_file_copy(job->source, job->destination, G_FILE_COPY_NONE, cancellable, trout_file_operation_progress, job, &error);
+  else succeeded = g_file_move(job->source, job->destination, G_FILE_COPY_NONE, cancellable, trout_file_operation_progress, job, &error);
+  if (succeeded) g_task_return_boolean(task, TRUE);
+  else g_task_return_error(task, error);
+  (void)source_object;
 }
 
 void
@@ -1183,12 +1656,12 @@ trout_tab_copy_directory_created(GObject *source, GAsyncResult *result, gpointer
   error = 0;
   succeeded = g_file_make_directory_finish(G_FILE(source), result, &error);
   if (!succeeded) {
-    trout_tab_show_error(job->status_label, error);
+    if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) trout_tab_show_error(job->status_label, error);
     g_error_free(error);
     trout_tab_file_job_destroy(job);
     return;
   }
-  g_file_enumerate_children_async(job->source, "standard::name", G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT, 0, trout_tab_copy_directory_enumerated, job);
+  g_file_enumerate_children_async(job->source, "standard::name", G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_enumerated, job);
 }
 
 void
@@ -1200,12 +1673,12 @@ trout_tab_copy_directory_enumerated(GObject *source, GAsyncResult *result, gpoin
   error = 0;
   job->enumerator = g_file_enumerate_children_finish(G_FILE(source), result, &error);
   if (job->enumerator == 0) {
-    trout_tab_show_error(job->status_label, error);
+    if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) trout_tab_show_error(job->status_label, error);
     g_error_free(error);
     trout_tab_file_job_destroy(job);
     return;
   }
-  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, 0, trout_tab_copy_directory_next_files, job);
+  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_next_files, job);
 }
 
 void
@@ -1224,7 +1697,7 @@ trout_tab_copy_directory_next_files(GObject *source, GAsyncResult *result, gpoin
   file_infos = g_file_enumerator_next_files_finish(G_FILE_ENUMERATOR(source), result, &error);
   if (file_infos == 0) {
     if (error != 0) {
-      trout_tab_show_error(job->status_label, error);
+      if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) trout_tab_show_error(job->status_label, error);
       g_error_free(error);
     }
     trout_tab_file_job_destroy(job);
@@ -1236,7 +1709,7 @@ trout_tab_copy_directory_next_files(GObject *source, GAsyncResult *result, gpoin
     name = g_strdup(g_file_info_get_name(file_info));
     source_file = g_file_get_child(job->source, name);
     destination_file = g_file_get_child(job->destination, name);
-    trout_tab_start_file_operation(job->status_label, source_file, destination_file, trout_file_operation_copy);
+    trout_tab_start_file_operation(job->status_label, source_file, destination_file, trout_file_operation_copy, job->transfer_request);
     g_object_unref(source_file);
     g_object_unref(destination_file);
     g_free(name);
@@ -1244,7 +1717,7 @@ trout_tab_copy_directory_next_files(GObject *source, GAsyncResult *result, gpoin
     file_info_node = file_info_node->next;
   }
   g_list_free(file_infos);
-  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, 0, trout_tab_copy_directory_next_files, job);
+  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_next_files, job);
 }
 
 void
@@ -1300,10 +1773,11 @@ trout_tab_copy_selection(trout_tab *tab, gboolean cut)
 void
 trout_tab_clipboard_read_destroy(trout_clipboard_read *read_data)
 {
-  g_object_unref(read_data->stream);
+  if (read_data->stream != 0) g_object_unref(read_data->stream);
+  g_object_unref(read_data->window_widget);
   g_object_unref(read_data->destination);
   g_object_unref(read_data->status_label);
-  g_byte_array_unref(read_data->bytes);
+  if (read_data->bytes != 0) g_byte_array_unref(read_data->bytes);
   g_free(read_data);
 }
 
@@ -1317,6 +1791,8 @@ trout_tab_paste(trout_tab *tab)
   mime_types[1] = "text/uri-list";
   mime_types[2] = 0;
   read_data = g_new0(trout_clipboard_read, 1);
+  read_data->window = tab->window;
+  read_data->window_widget = g_object_ref(tab->window->window);
   destination = tab->context_file_is_directory ? tab->context_file : tab->directory;
   read_data->destination = g_object_ref(destination);
   read_data->status_label = g_object_ref(tab->status_label);
@@ -1336,9 +1812,7 @@ trout_tab_clipboard_read_start(GObject *source, GAsyncResult *result, gpointer u
       trout_tab_show_error(read_data->status_label, error);
       g_error_free(error);
     }
-    g_object_unref(read_data->destination);
-    g_object_unref(read_data->status_label);
-    g_free(read_data);
+    trout_tab_clipboard_read_destroy(read_data);
     return;
   }
   read_data->bytes = g_byte_array_new();
@@ -1360,6 +1834,9 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
   GFile *destination;
   char *name;
   GError *error;
+  GPtrArray *sources;
+  GPtrArray *destinations;
+  guint operation;
   read_data = user_data;
   error = 0;
   chunk = g_input_stream_read_bytes_finish(G_INPUT_STREAM(source), result, &error);
@@ -1384,19 +1861,26 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
   if (g_str_has_prefix(contents, "cut\n")) uris_text += 4;
   else if (g_str_has_prefix(contents, "copy\n")) uris_text += 5;
   uris = g_uri_list_extract_uris(uris_text);
+  sources = g_ptr_array_new_with_free_func(g_object_unref);
+  destinations = g_ptr_array_new_with_free_func(g_object_unref);
+  operation = g_str_has_prefix(contents, "cut\n") ? trout_file_operation_move : trout_file_operation_copy;
   uri = uris;
   while (uri != 0 && *uri != 0) {
     file = g_file_new_for_uri(*uri);
     name = g_file_get_basename(file);
     if (name != 0) {
       destination = g_file_get_child(read_data->destination, name);
-      if (!g_file_equal(file, destination)) trout_tab_start_file_operation(read_data->status_label, file, destination, g_str_has_prefix(contents, "cut\n") ? trout_file_operation_move : trout_file_operation_copy);
+      if (!g_file_equal(file, destination)) {
+        g_ptr_array_add(sources, g_object_ref(file));
+        g_ptr_array_add(destinations, g_object_ref(destination));
+      }
       g_object_unref(destination);
       g_free(name);
     }
     g_object_unref(file);
     uri += 1;
   }
+  trout_transfer_request_enqueue(read_data->window, read_data->status_label, sources, destinations, operation);
   g_strfreev(uris);
   g_free(contents);
   trout_tab_clipboard_read_destroy(read_data);
@@ -1440,6 +1924,9 @@ trout_tab_rename_accept(GtkWidget *widget, gpointer user_data)
   GtkWidget *dialog;
   GFile *parent;
   GFile *destination;
+  GPtrArray *sources;
+  GPtrArray *destinations;
+  trout_window *window;
   char *name;
   rename_data = user_data;
   dialog = GTK_WIDGET(gtk_widget_get_root(widget));
@@ -1447,7 +1934,14 @@ trout_tab_rename_accept(GtkWidget *widget, gpointer user_data)
   if (name[0] != '\0' && strchr(name, '/') == 0 && strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
     parent = g_file_get_parent(rename_data->source);
     destination = g_file_get_child(parent, name);
-    if (!g_file_equal(rename_data->source, destination)) trout_tab_start_file_operation(rename_data->status_label, rename_data->source, destination, trout_file_operation_move);
+    if (!g_file_equal(rename_data->source, destination)) {
+      sources = g_ptr_array_new_with_free_func(g_object_unref);
+      destinations = g_ptr_array_new_with_free_func(g_object_unref);
+      g_ptr_array_add(sources, g_object_ref(rename_data->source));
+      g_ptr_array_add(destinations, g_object_ref(destination));
+      window = g_object_get_data(G_OBJECT(gtk_widget_get_root(rename_data->status_label)), "trout_window");
+      trout_transfer_request_enqueue(window, rename_data->status_label, sources, destinations, trout_file_operation_move);
+    }
     g_object_unref(destination);
     g_object_unref(parent);
     gtk_window_destroy(GTK_WINDOW(dialog));
@@ -1676,6 +2170,7 @@ trout_tab_build_grid(trout_tab *tab)
   GtkListItemFactory *factory;
   GtkWidget *grid;
   GtkGesture *click;
+  GtkGesture *context_click;
   GtkEventController *scroll;
   factory = gtk_signal_list_item_factory_new();
   g_signal_connect(factory, "setup", G_CALLBACK(trout_tab_factory_setup), tab);
@@ -1693,6 +2188,11 @@ trout_tab_build_grid(trout_tab *tab)
   gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(click), GTK_PHASE_CAPTURE);
   g_signal_connect(click, "pressed", G_CALLBACK(trout_tab_on_background_pressed), tab);
   gtk_widget_add_controller(grid, GTK_EVENT_CONTROLLER(click));
+  context_click = gtk_gesture_click_new();
+  gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(context_click), GDK_BUTTON_SECONDARY);
+  gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(context_click), GTK_PHASE_CAPTURE);
+  g_signal_connect(context_click, "pressed", G_CALLBACK(trout_tab_on_background_context_pressed), tab);
+  gtk_widget_add_controller(grid, GTK_EVENT_CONTROLLER(context_click));
   scroll = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES | GTK_EVENT_CONTROLLER_SCROLL_DISCRETE);
   g_signal_connect(scroll, "scroll", G_CALLBACK(trout_tab_on_scroll), tab);
   gtk_widget_add_controller(grid, scroll);
@@ -1713,6 +2213,66 @@ trout_tab_on_background_pressed(GtkGestureClick *gesture, gint press_count, doub
   if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) != 0) return;
   gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(tab->selection));
   (void)press_count;
+}
+
+void
+trout_tab_on_background_context_pressed(GtkGestureClick *gesture, gint press_count, double x, double y, gpointer user_data)
+{
+  trout_tab *tab;
+  GtkWidget *target;
+  GtkWidget *popover;
+  GtkWidget *menu_items;
+  GdkRectangle point;
+  tab = user_data;
+  target = gtk_widget_pick(tab->grid, x, y, GTK_PICK_DEFAULT);
+  if (target != tab->grid) return;
+  gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(tab->selection));
+  if (tab->context_file != 0) g_object_unref(tab->context_file);
+  tab->context_file = g_object_ref(tab->directory);
+  tab->context_file_is_directory = TRUE;
+  if (tab->context_popover != 0) {
+    popover = tab->context_popover;
+    tab->context_popover = 0;
+    if (gtk_widget_get_parent(popover) != 0) gtk_widget_unparent(popover);
+  }
+  popover = gtk_popover_new();
+  tab->context_popover = popover;
+  menu_items = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+  gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Paste", "paste", tab, popover));
+  gtk_popover_set_child(GTK_POPOVER(popover), menu_items);
+  g_signal_connect(popover, "closed", G_CALLBACK(trout_tab_context_closed), tab);
+  point.x = x;
+  point.y = y;
+  point.width = 1;
+  point.height = 1;
+  gtk_popover_set_pointing_to(GTK_POPOVER(popover), &point);
+  gtk_widget_set_parent(popover, tab->grid);
+  gtk_popover_popup(GTK_POPOVER(popover));
+  gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  gtk_widget_grab_focus(tab->grid);
+  (void)press_count;
+}
+
+void
+trout_tab_on_entry_pressed(GtkGestureClick *gesture, gint press_count, double x, double y, gpointer user_data)
+{
+  trout_tab *tab;
+  GtkWidget *row;
+  GtkListItem *list_item;
+  guint position;
+  GdkModifierType state;
+  tab = user_data;
+  row = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+  list_item = g_object_get_data(G_OBJECT(row), "trout_list_item");
+  position = gtk_list_item_get_position(list_item);
+  state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(gesture));
+  gtk_widget_grab_focus(tab->grid);
+  gtk_widget_activate_action(tab->grid, "list.select-item", "(ubb)", position,
+      (state & GDK_CONTROL_MASK) != 0, (state & GDK_SHIFT_MASK) != 0);
+  if (press_count == 2) gtk_widget_activate_action(tab->grid, "list.activate-item", "u", position);
+  gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+  (void)x;
+  (void)y;
 }
 
 gboolean
@@ -1790,7 +2350,6 @@ trout_tab_create(trout_window *window, GFile *directory)
   trout_tab *tab;
   trout_preferences *preferences;
   GtkWidget *root;
-  GtkWidget *location_box;
   GtkEventController *entry_keys;
   GtkEventController *entry_focus;
   GtkWidget *location_entry;
@@ -1810,13 +2369,14 @@ trout_tab_create(trout_window *window, GFile *directory)
   g_signal_connect(tab->directory_list, "items-changed", G_CALLBACK(trout_tab_on_directory_items_changed), tab);
   tab->filter = gtk_custom_filter_new(trout_filter_hidden, 0, 0);
   tab->filtered_list = gtk_filter_list_model_new(G_LIST_MODEL(g_object_ref(tab->directory_list)), GTK_FILTER(g_object_ref(tab->filter)));
-  tab->sorted_list = gtk_sort_list_model_new(G_LIST_MODEL(g_object_ref(tab->filtered_list)), trout_create_file_sorter());
+  tab->sorted_list = gtk_sort_list_model_new(G_LIST_MODEL(g_object_ref(tab->filtered_list)), trout_create_file_sorter(tab->sort_order));
   gtk_sort_list_model_set_incremental(tab->sorted_list, TRUE);
   tab->selection = gtk_multi_selection_new(G_LIST_MODEL(g_object_ref(tab->sorted_list)));
   root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   g_object_set_data_full(G_OBJECT(root), "trout_tab", tab, trout_tab_destroy);
   tab->location_stack = gtk_stack_new();
   tab->path_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class(tab->path_buttons, "trout_location_buttons");
   gtk_widget_set_hexpand(tab->path_buttons, TRUE);
   gtk_stack_add_named(GTK_STACK(tab->location_stack), tab->path_buttons, "buttons");
   location_entry = gtk_entry_new();
@@ -1834,13 +2394,7 @@ trout_tab_create(trout_window *window, GFile *directory)
   g_signal_connect(entry_focus, "leave", G_CALLBACK(trout_tab_on_location_focus_leave), tab);
   gtk_widget_add_controller(location_entry, entry_focus);
   g_signal_connect(location_entry, "activate", G_CALLBACK(trout_tab_on_location_activate), tab);
-  location_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_widget_set_margin_start(location_box, 6);
-  gtk_widget_set_margin_end(location_box, 6);
-  gtk_widget_set_margin_top(location_box, 6);
-  gtk_widget_set_margin_bottom(location_box, 6);
-  gtk_box_append(GTK_BOX(location_box), tab->location_stack);
-  gtk_box_append(GTK_BOX(root), location_box);
+  gtk_stack_add_child(GTK_STACK(window->location_box), tab->location_stack);
   scrolled = gtk_scrolled_window_new();
   tab->scrolled_window = scrolled;
   gtk_widget_set_vexpand(scrolled, TRUE);
@@ -1872,20 +2426,34 @@ trout_window_page_changed(GtkNotebook *notebook, GtkWidget *page, guint page_num
   trout_tab *tab;
   window = user_data;
   tab = g_object_get_data(G_OBJECT(page), "trout_tab");
+  gtk_stack_set_visible_child(GTK_STACK(window->location_box), tab->location_stack);
   trout_tab_clear_typeahead(tab);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(window->hidden_button), gtk_filter_list_model_get_filter(tab->filtered_list) == 0);
+  trout_window_update_sort_menu(window, tab);
   trout_window_update_custom_actions(window);
   (void)notebook;
   (void)page_number;
 }
 
 void
-trout_window_pages_changed(GtkNotebook *notebook, GtkWidget *page, guint page_number, gpointer user_data)
+trout_window_page_added(GtkNotebook *notebook, GtkWidget *page, guint page_number, gpointer user_data)
 {
   gtk_notebook_set_show_tabs(notebook, gtk_notebook_get_n_pages(notebook) > 1);
   (void)page;
   (void)page_number;
   (void)user_data;
+}
+
+void
+trout_window_page_removed(GtkNotebook *notebook, GtkWidget *page, guint page_number, gpointer user_data)
+{
+  trout_window *window;
+  trout_tab *tab;
+  window = user_data;
+  tab = g_object_get_data(G_OBJECT(page), "trout_tab");
+  gtk_stack_remove(GTK_STACK(window->location_box), tab->location_stack);
+  gtk_notebook_set_show_tabs(notebook, gtk_notebook_get_n_pages(notebook) > 1);
+  (void)page_number;
 }
 
 void
@@ -1990,6 +2558,30 @@ trout_window_make_action_button(char *label, char *action_name, trout_window *wi
   return button;
 }
 
+void
+trout_window_sort_toggled(GtkCheckButton *button, gpointer user_data)
+{
+  trout_window *window;
+  trout_tab *tab;
+  guint sort_order;
+  window = user_data;
+  if (!window->updating_sort_menu && gtk_check_button_get_active(button)) {
+    tab = trout_window_get_current_tab(window);
+    sort_order = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(button), "trout_sort_order"));
+    if (tab != 0) trout_tab_set_sort_order(tab, sort_order);
+  }
+}
+
+void
+trout_window_update_sort_menu(trout_window *window, trout_tab *tab)
+{
+  window->updating_sort_menu = TRUE;
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(window->sort_name_button), tab->sort_order == trout_sort_name);
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(window->sort_modified_button), tab->sort_order == trout_sort_modified);
+  gtk_check_button_set_active(GTK_CHECK_BUTTON(window->sort_size_button), tab->sort_order == trout_sort_size);
+  window->updating_sort_menu = FALSE;
+}
+
 GtkWidget *
 trout_window_create(GtkApplication *application, GFile *directory)
 {
@@ -1999,7 +2591,8 @@ trout_window_create(GtkApplication *application, GFile *directory)
   GtkWidget *menu_button;
   GtkWidget *popover;
   GtkWidget *menu_actions;
-  GtkWidget *title_widget;
+  GtkWidget *header_controls;
+  GtkWidget *separator;
   GPtrArray *actions;
   trout_action *action;
   guint action_index;
@@ -2008,15 +2601,20 @@ trout_window_create(GtkApplication *application, GFile *directory)
   window->application = application;
   window->thumbnailer = g_object_get_data(G_OBJECT(application), "trout_thumbnailer");
   window->window = gtk_application_window_new(application);
+  g_queue_init(&window->transfer_queue);
   window->clipboard = gdk_display_get_clipboard(gtk_widget_get_display(window->window));
   window->notebook = gtk_notebook_new();
   g_object_set_data_full(G_OBJECT(window->window), "trout_window", window, g_free);
+  gtk_window_set_title(GTK_WINDOW(window->window), "");
   gtk_window_set_default_size(GTK_WINDOW(window->window), trout_window_width, trout_window_height);
   header = gtk_header_bar_new();
   gtk_header_bar_set_show_title_buttons(GTK_HEADER_BAR(header), FALSE);
-  title_widget = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header), title_widget);
+  header_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  window->location_box = gtk_stack_new();
+  gtk_widget_set_hexpand(window->location_box, TRUE);
+  gtk_box_append(GTK_BOX(header_controls), window->location_box);
   window->custom_action_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class(window->custom_action_box, "trout_action_buttons");
   actions = g_object_get_data(G_OBJECT(application), "trout_actions");
   action_index = 0;
   while (action_index < actions->len) {
@@ -2028,7 +2626,8 @@ trout_window_create(GtkApplication *application, GFile *directory)
     }
     action_index += 1;
   }
-  gtk_header_bar_pack_start(GTK_HEADER_BAR(header), window->custom_action_box);
+  gtk_box_append(GTK_BOX(header_controls), window->custom_action_box);
+  gtk_header_bar_pack_start(GTK_HEADER_BAR(header), header_controls);
   menu_button = gtk_menu_button_new();
   gtk_menu_button_set_label(GTK_MENU_BUTTON(menu_button), "≡");
   popover = gtk_popover_new();
@@ -2042,6 +2641,25 @@ trout_window_create(GtkApplication *application, GFile *directory)
   g_object_set_data(G_OBJECT(button), "trout_action", (gpointer)"win.toggle-hidden");
   g_object_set_data(G_OBJECT(button), "trout_popover", popover);
   gtk_box_append(GTK_BOX(menu_actions), button);
+  separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+  gtk_box_append(GTK_BOX(menu_actions), separator);
+  button = gtk_check_button_new_with_label("Sort by name");
+  window->sort_name_button = button;
+  g_object_set_data(G_OBJECT(button), "trout_sort_order", GUINT_TO_POINTER(trout_sort_name));
+  g_signal_connect(button, "toggled", G_CALLBACK(trout_window_sort_toggled), window);
+  gtk_box_append(GTK_BOX(menu_actions), button);
+  button = gtk_check_button_new_with_label("Modification time (newest first)");
+  window->sort_modified_button = button;
+  gtk_check_button_set_group(GTK_CHECK_BUTTON(button), GTK_CHECK_BUTTON(window->sort_name_button));
+  g_object_set_data(G_OBJECT(button), "trout_sort_order", GUINT_TO_POINTER(trout_sort_modified));
+  g_signal_connect(button, "toggled", G_CALLBACK(trout_window_sort_toggled), window);
+  gtk_box_append(GTK_BOX(menu_actions), button);
+  button = gtk_check_button_new_with_label("Size (largest first)");
+  window->sort_size_button = button;
+  gtk_check_button_set_group(GTK_CHECK_BUTTON(button), GTK_CHECK_BUTTON(window->sort_name_button));
+  g_object_set_data(G_OBJECT(button), "trout_sort_order", GUINT_TO_POINTER(trout_sort_size));
+  g_signal_connect(button, "toggled", G_CALLBACK(trout_window_sort_toggled), window);
+  gtk_box_append(GTK_BOX(menu_actions), button);
   gtk_popover_set_child(GTK_POPOVER(popover), menu_actions);
   gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_button), popover);
   gtk_header_bar_pack_end(GTK_HEADER_BAR(header), menu_button);
@@ -2050,8 +2668,8 @@ trout_window_create(GtkApplication *application, GFile *directory)
   gtk_widget_set_vexpand(window->notebook, TRUE);
   gtk_window_set_child(GTK_WINDOW(window->window), window->notebook);
   g_signal_connect(window->notebook, "switch-page", G_CALLBACK(trout_window_page_changed), window);
-  g_signal_connect(window->notebook, "page-added", G_CALLBACK(trout_window_pages_changed), window);
-  g_signal_connect(window->notebook, "page-removed", G_CALLBACK(trout_window_pages_changed), window);
+  g_signal_connect(window->notebook, "page-added", G_CALLBACK(trout_window_page_added), window);
+  g_signal_connect(window->notebook, "page-removed", G_CALLBACK(trout_window_page_removed), window);
   keys = gtk_event_controller_key_new();
   gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(keys), GTK_PHASE_CAPTURE);
   g_signal_connect(keys, "key-pressed", G_CALLBACK(trout_window_on_key), window);
@@ -2122,12 +2740,9 @@ void
 trout_application_activate(GtkApplication *application, gpointer user_data)
 {
   GFile *directory;
-  char *path;
-  path = g_get_current_dir();
-  directory = g_file_new_for_path(path);
+  directory = g_file_new_for_path(g_get_home_dir());
   trout_window_create(application, directory);
   g_object_unref(directory);
-  g_free(path);
   (void)user_data;
 }
 
@@ -2167,14 +2782,11 @@ void
 trout_application_open(GApplication *application, GFile **files, gint file_count, char *hint, gpointer user_data)
 {
   GFile *directory;
-  char *path;
   if (file_count > 0) directory = files[0];
   else {
-    path = g_get_current_dir();
-    directory = g_file_new_for_path(path);
+    directory = g_file_new_for_path(g_get_home_dir());
     trout_window_create(GTK_APPLICATION(application), directory);
     g_object_unref(directory);
-    g_free(path);
     (void)hint;
     (void)user_data;
     return;
