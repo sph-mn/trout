@@ -1,0 +1,6 @@
+#!/bin/sh
+
+set -eu
+
+export MALLOC_CHECK_=2
+exec ./exe/compiled/test-trout

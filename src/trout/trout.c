@@ -8,6 +8,7 @@
 #include <glib/gstdio.h>
 #include <spawn.h>
 #include <string.h>
+#include "file_transfer.h"
 #include "thumbnailer.h"
 
 #define trout_window_width 1100
@@ -28,8 +29,6 @@
 #define trout_icon_size_minimum 16
 #define trout_compact_max_rows 128
 #define trout_typeahead_timeout_milliseconds 5000
-#define trout_file_operation_copy 1
-#define trout_file_operation_move 2
 #define trout_sort_name 0
 #define trout_sort_modified 1
 #define trout_sort_size 2
@@ -43,13 +42,13 @@
 
 typedef struct trout_window trout_window;
 typedef struct trout_tab trout_tab;
-typedef struct trout_file_job trout_file_job;
+typedef struct trout_delete_job trout_delete_job;
 typedef struct trout_clipboard_read trout_clipboard_read;
 typedef struct trout_rename_dialog trout_rename_dialog;
 typedef struct trout_preferences trout_preferences;
 typedef struct trout_action trout_action;
 typedef struct trout_transfer_request trout_transfer_request;
-typedef struct trout_deferred_operation trout_deferred_operation;
+typedef struct trout_transfer_prompt trout_transfer_prompt;
 typedef struct trout_file_progress_update trout_file_progress_update;
 
 struct trout_preferences {
@@ -65,6 +64,7 @@ struct trout_action {
   guint file_types;
   char **extensions;
   char **command;
+  gboolean any_extension;
 };
 
 struct trout_window {
@@ -119,41 +119,42 @@ struct trout_tab {
   gboolean completion_suppressed;
 };
 
-struct trout_file_job {
+struct trout_delete_job {
   GtkWidget *status_label;
   GFile *source;
-  GFile *destination;
   GFileEnumerator *enumerator;
-  trout_file_job *parent;
+  trout_delete_job *parent;
   guint pending_children;
-  guint operation;
   gboolean delete_enumeration_done;
   gboolean delete_failed;
-  trout_transfer_request *transfer_request;
+};
+
+struct trout_transfer_prompt {
+  GtkWidget *dialog;
+  GFile *source;
+  GFile *destination;
+  GFileType source_type;
+  GFileType destination_type;
+  GMutex mutex;
+  GCond condition;
+  trout_file_collision_choice choice;
+  gboolean active;
+  gboolean choice_ready;
 };
 
 struct trout_transfer_request {
   trout_window *window;
   GtkWidget *window_widget;
   GtkWidget *status_label;
-  GPtrArray *sources;
-  GPtrArray *destinations;
-  GQueue deferred_operations;
+  GPtrArray *operations;
+  trout_transfer_prompt collision;
   GCancellable *cancellable;
   GMutex pause_mutex;
   GCond pause_condition;
-  guint operation;
-  guint pending;
+  trout_file_operation operation;
   gint references;
-  gboolean starting;
   gboolean paused;
   char *current_name;
-};
-
-struct trout_deferred_operation {
-  GFile *source;
-  GFile *destination;
-  guint operation;
 };
 
 struct trout_file_progress_update {
@@ -188,6 +189,7 @@ void trout_tab_edit_location(trout_tab *tab);
 void trout_tab_complete_location(trout_tab *tab, gboolean highlight);
 void trout_window_update_custom_actions(trout_window *window);
 gboolean trout_action_matches_selection(trout_action *action, trout_tab *tab);
+gboolean trout_action_matches_file(trout_action *action, GFileInfo *file_info);
 void trout_action_activate(GtkButton *button, gpointer user_data);
 void trout_action_child_exited(GPid process_id, gint wait_status, gpointer user_data);
 GtkWidget *trout_action_make_button(trout_action *action, trout_window *window, GtkWidget *popover);
@@ -205,6 +207,7 @@ void trout_preferences_schedule_save(trout_preferences *preferences);
 status_t trout_preferences_save(trout_preferences *preferences);
 gboolean trout_preferences_save_timeout(gpointer user_data);
 GPtrArray *trout_action_config_load(void);
+GPtrArray *trout_action_config_parse(char *contents);
 void trout_action_config_destroy(gpointer user_data);
 void trout_action_destroy(gpointer user_data);
 void trout_tab_on_path_clicked(GtkButton *button, gpointer user_data);
@@ -222,32 +225,32 @@ void trout_tab_paste(trout_tab *tab);
 void trout_tab_rename_context_file(trout_tab *tab);
 void trout_tab_delete_selection(trout_tab *tab);
 void trout_tab_show_error(GtkWidget *status_label, GError *error);
-void trout_tab_start_file_operation(GtkWidget *status_label, GFile *source, GFile *destination, guint operation, trout_transfer_request *request);
-void trout_tab_file_job_destroy(trout_file_job *job);
-void trout_tab_file_operation_complete(GObject *source, GAsyncResult *result, gpointer user_data);
-void trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GPtrArray *sources, GPtrArray *destinations, guint operation);
+void trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GPtrArray *operations, trout_file_operation operation);
 void trout_transfer_request_start_next(trout_window *window);
 void trout_transfer_request_finish(trout_transfer_request *request);
 void trout_transfer_request_destroy(trout_transfer_request *request);
 trout_transfer_request *trout_transfer_request_ref(trout_transfer_request *request);
 void trout_transfer_request_release_pause(trout_transfer_request *request);
-void trout_transfer_request_resume_deferred(trout_transfer_request *request);
-void trout_transfer_request_discard_deferred(trout_transfer_request *request);
+void trout_transfer_request_cancel(trout_transfer_request *request);
+gboolean trout_transfer_request_show_collision(gpointer user_data);
+void trout_transfer_request_resolve_collision(GtkButton *button, gpointer user_data);
 void trout_transfer_request_update_label(trout_transfer_request *request);
+gboolean trout_transfer_request_wait(gpointer user_data);
+trout_file_collision_choice trout_transfer_request_collision(GFile *source, GFile *destination, GFileType source_type, GFileType destination_type, gpointer user_data);
+void trout_transfer_request_progress(GFile *source, goffset current_bytes, goffset total_bytes, gpointer user_data);
+void trout_transfer_request_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable);
+void trout_transfer_request_complete(GObject *source, GAsyncResult *result, gpointer user_data);
+void trout_transfer_request_unref(gpointer user_data);
 void trout_transfer_pause(GtkButton *button, gpointer user_data);
 void trout_transfer_cancel(GtkButton *button, gpointer user_data);
-void trout_file_operation_progress(goffset current_bytes, goffset total_bytes, gpointer user_data);
 gboolean trout_file_operation_progress_update(gpointer user_data);
 void trout_file_operation_progress_update_destroy(gpointer user_data);
-void trout_file_operation_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable);
-void trout_tab_start_delete_operation(GtkWidget *status_label, GFile *source, trout_file_job *parent);
+void trout_tab_start_delete_operation(GtkWidget *status_label, GFile *source, trout_delete_job *parent);
+void trout_tab_delete_job_destroy(trout_delete_job *job);
 void trout_tab_delete_operation_complete(GObject *source, GAsyncResult *result, gpointer user_data);
 void trout_tab_delete_directory_enumerated(GObject *source, GAsyncResult *result, gpointer user_data);
 void trout_tab_delete_directory_next_files(GObject *source, GAsyncResult *result, gpointer user_data);
-void trout_tab_delete_job_finish(trout_file_job *job, gboolean failed);
-void trout_tab_copy_directory_created(GObject *source, GAsyncResult *result, gpointer user_data);
-void trout_tab_copy_directory_enumerated(GObject *source, GAsyncResult *result, gpointer user_data);
-void trout_tab_copy_directory_next_files(GObject *source, GAsyncResult *result, gpointer user_data);
+void trout_tab_delete_job_finish(trout_delete_job *job, gboolean failed);
 void trout_tab_clipboard_read_start(GObject *source, GAsyncResult *result, gpointer user_data);
 void trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer user_data);
 void trout_tab_clipboard_read_destroy(trout_clipboard_read *read_data);
@@ -386,27 +389,15 @@ trout_action_destroy(gpointer user_data)
 }
 
 GPtrArray *
-trout_action_config_load(void)
+trout_action_config_parse(char *contents)
 {
   GPtrArray *actions;
-  GError *error;
-  char *path;
-  char *contents;
   char **lines;
   char **line;
   char **fields;
+  char **extension;
   trout_action *action;
   actions = g_ptr_array_new_with_free_func(trout_action_destroy);
-  path = g_build_filename(g_get_user_config_dir(), "trout", "actions", (char *)0);
-  error = 0;
-  if (!g_file_get_contents(path, &contents, 0, &error)) {
-    if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
-      g_warning("Could not read Trout custom actions: %s", error->message);
-    }
-    g_error_free(error);
-    g_free(path);
-    return actions;
-  }
   lines = g_strsplit(contents, "\n", -1);
   line = lines;
   while (*line != 0) {
@@ -421,6 +412,14 @@ trout_action_config_load(void)
       else if (g_strcmp0(fields[2], "f") == 0) action->file_types = trout_action_type_files;
       else action->file_types = trout_action_type_directories | trout_action_type_files;
       action->extensions = g_strsplit(fields[3], ",", -1);
+      extension = action->extensions;
+      while (*extension != 0) {
+        if (g_strcmp0(*extension, "*") == 0) {
+          action->any_extension = TRUE;
+          break;
+        }
+        extension += 1;
+      }
       action->command = g_strdupv(fields + 4);
       g_ptr_array_add(actions, action);
       g_strfreev(fields);
@@ -428,6 +427,27 @@ trout_action_config_load(void)
     line += 1;
   }
   g_strfreev(lines);
+  return actions;
+}
+
+GPtrArray *
+trout_action_config_load(void)
+{
+  GPtrArray *actions;
+  GError *error;
+  char *path;
+  char *contents;
+  path = g_build_filename(g_get_user_config_dir(), "trout", "actions", (char *)0);
+  error = 0;
+  if (!g_file_get_contents(path, &contents, 0, &error)) {
+    if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+      g_warning("Could not read Trout custom actions: %s", error->message);
+    }
+    g_error_free(error);
+    g_free(path);
+    return g_ptr_array_new_with_free_func(trout_action_destroy);
+  }
+  actions = trout_action_config_parse(contents);
   g_free(contents);
   g_free(path);
   return actions;
@@ -449,53 +469,51 @@ trout_window_get_current_tab(trout_window *window)
 }
 
 gboolean
-trout_action_matches_selection(trout_action *action, trout_tab *tab)
+trout_action_matches_file(trout_action *action, GFileInfo *file_info)
 {
-  GtkBitset *selected;
-  GtkBitsetIter iterator;
-  GFileInfo *file_info;
   GFile *file;
   GFileType file_type;
   char *name;
   char *extension_start;
   char **extension;
+  gboolean matches;
+  file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
+  file_type = g_file_info_get_file_type(file_info);
+  matches = g_file_is_native(file) &&
+      ((file_type == G_FILE_TYPE_DIRECTORY && (action->file_types & trout_action_type_directories) != 0) ||
+      (file_type != G_FILE_TYPE_DIRECTORY && (action->file_types & trout_action_type_files) != 0));
+  if (matches && !action->any_extension) {
+    name = (char *)g_file_info_get_name(file_info);
+    extension_start = strrchr(name, '.');
+    if (extension_start == 0 || extension_start == name || extension_start[1] == '\0') {
+      matches = FALSE;
+    } else {
+      extension = action->extensions;
+      while (*extension != 0 && g_strcmp0(*extension, extension_start + 1) != 0) extension += 1;
+      matches = *extension != 0;
+    }
+  }
+  return matches;
+}
+
+gboolean
+trout_action_matches_selection(trout_action *action, trout_tab *tab)
+{
+  GtkBitset *selected;
+  GtkBitsetIter iterator;
+  GFileInfo *file_info;
   guint position;
   gboolean matches;
-  gboolean any_extension;
   selected = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
   if (gtk_bitset_get_size(selected) == 0) {
     gtk_bitset_unref(selected);
     return FALSE;
   }
-  any_extension = FALSE;
-  extension = action->extensions;
-  while (*extension != 0) {
-    if (g_strcmp0(*extension, "*") == 0) {
-      any_extension = TRUE;
-      break;
-    }
-    extension += 1;
-  }
   matches = TRUE;
   gtk_bitset_iter_init_first(&iterator, selected, &position);
   while (matches) {
     file_info = g_list_model_get_item(G_LIST_MODEL(tab->sorted_list), position);
-    file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
-    file_type = g_file_info_get_file_type(file_info);
-    matches = g_file_is_native(file) &&
-        ((file_type == G_FILE_TYPE_DIRECTORY && (action->file_types & trout_action_type_directories) != 0) ||
-        (file_type != G_FILE_TYPE_DIRECTORY && (action->file_types & trout_action_type_files) != 0));
-    if (matches && !any_extension) {
-      name = (char *)g_file_info_get_name(file_info);
-      extension_start = strrchr(name, '.');
-      if (extension_start == 0 || extension_start == name || extension_start[1] == '\0') {
-        matches = FALSE;
-      } else {
-        extension = action->extensions;
-        while (*extension != 0 && g_strcmp0(*extension, extension_start + 1) != 0) extension += 1;
-        matches = *extension != 0;
-      }
-    }
+    matches = trout_action_matches_file(action, file_info);
     g_object_unref(file_info);
     if (matches && !gtk_bitset_iter_next(&iterator, &position)) break;
   }
@@ -1157,93 +1175,16 @@ trout_tab_show_error(GtkWidget *status_label, GError *error)
 }
 
 void
-trout_tab_start_file_operation(GtkWidget *status_label, GFile *source, GFile *destination, guint operation, trout_transfer_request *request)
-{
-  trout_file_job *job;
-  trout_deferred_operation *deferred;
-  GTask *task;
-  if (request->paused) {
-    deferred = g_new0(trout_deferred_operation, 1);
-    deferred->source = g_object_ref(source);
-    deferred->destination = g_object_ref(destination);
-    deferred->operation = operation;
-    request->pending += 1;
-    g_queue_push_tail(&request->deferred_operations, deferred);
-    return;
-  }
-  job = g_new0(trout_file_job, 1);
-  job->status_label = g_object_ref(status_label);
-  job->source = g_object_ref(source);
-  if (destination != 0) job->destination = g_object_ref(destination);
-  job->operation = operation;
-  job->transfer_request = request;
-  request->pending += 1;
-  if (g_cancellable_is_cancelled(request->cancellable)) {
-    trout_tab_file_job_destroy(job);
-    return;
-  }
-  g_free(request->current_name);
-  request->current_name = g_file_get_basename(source);
-  trout_transfer_request_update_label(request);
-  task = g_task_new(source, request->cancellable, trout_tab_file_operation_complete, job);
-  g_task_set_task_data(task, job, 0);
-  g_task_run_in_thread(task, trout_file_operation_worker);
-  g_object_unref(task);
-}
-
-void
-trout_tab_file_job_destroy(trout_file_job *job)
-{
-  trout_transfer_request *request;
-  request = job->transfer_request;
-  g_object_unref(job->status_label);
-  g_object_unref(job->source);
-  if (job->destination != 0) g_object_unref(job->destination);
-  if (job->enumerator != 0) g_object_unref(job->enumerator);
-  g_free(job);
-  if (request != 0) {
-    request->pending -= 1;
-    if (request->pending == 0 && !request->starting) trout_transfer_request_finish(request);
-  }
-}
-
-void
-trout_tab_file_operation_complete(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-  trout_file_job *job;
-  GError *error;
-  gboolean succeeded;
-  job = user_data;
-  error = 0;
-  succeeded = g_task_propagate_boolean(G_TASK(result), &error);
-  if (job->operation == trout_file_operation_copy) {
-    if (!succeeded && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_RECURSE)) {
-      g_error_free(error);
-      if (g_file_has_prefix(job->destination, job->source)) {
-        gtk_label_set_text(GTK_LABEL(job->status_label), "Cannot copy a directory into itself or one of its subdirectories");
-        trout_tab_file_job_destroy(job);
-        return;
-      }
-      g_file_make_directory_async(job->destination, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_created, job);
-      return;
-    }
-  }
-  if (!succeeded && error != 0 && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-    trout_tab_show_error(job->status_label, error);
-    g_error_free(error);
-  }
-  trout_tab_file_job_destroy(job);
-  (void)source;
-}
-
-void
 trout_transfer_request_destroy(trout_transfer_request *request)
 {
   if (g_atomic_int_dec_and_test(&request->references)) {
     g_object_unref(request->window_widget);
     g_object_unref(request->status_label);
-    g_ptr_array_unref(request->sources);
-    g_ptr_array_unref(request->destinations);
+    g_ptr_array_unref(request->operations);
+    g_clear_object(&request->collision.source);
+    g_clear_object(&request->collision.destination);
+    g_cond_clear(&request->collision.condition);
+    g_mutex_clear(&request->collision.mutex);
     g_free(request->current_name);
     g_object_unref(request->cancellable);
     g_cond_clear(&request->pause_condition);
@@ -1268,42 +1209,203 @@ trout_transfer_request_release_pause(trout_transfer_request *request)
   g_mutex_unlock(&request->pause_mutex);
 }
 
-void
-trout_transfer_request_resume_deferred(trout_transfer_request *request)
+gboolean
+trout_transfer_request_wait(gpointer user_data)
 {
-  trout_deferred_operation *deferred;
-  while (!g_queue_is_empty(&request->deferred_operations)) {
-    deferred = g_queue_pop_head(&request->deferred_operations);
-    request->pending -= 1;
-    trout_tab_start_file_operation(request->status_label, deferred->source, deferred->destination, deferred->operation, request);
-    g_object_unref(deferred->source);
-    g_object_unref(deferred->destination);
-    g_free(deferred);
-  }
-  if (request->pending == 0 && !request->starting) trout_transfer_request_finish(request);
+  trout_transfer_request *request;
+  request = user_data;
+  g_mutex_lock(&request->pause_mutex);
+  while (request->paused && !g_cancellable_is_cancelled(request->cancellable)) g_cond_wait(&request->pause_condition, &request->pause_mutex);
+  g_mutex_unlock(&request->pause_mutex);
+  return !g_cancellable_is_cancelled(request->cancellable);
 }
 
 void
-trout_transfer_request_discard_deferred(trout_transfer_request *request)
+trout_transfer_request_progress(GFile *source, goffset current_bytes, goffset total_bytes, gpointer user_data)
 {
-  trout_deferred_operation *deferred;
-  while (!g_queue_is_empty(&request->deferred_operations)) {
-    deferred = g_queue_pop_head(&request->deferred_operations);
-    request->pending -= 1;
-    g_object_unref(deferred->source);
-    g_object_unref(deferred->destination);
-    g_free(deferred);
+  trout_transfer_request *request;
+  trout_file_progress_update *update;
+  GSource *idle_source;
+  request = user_data;
+  if (g_cancellable_is_cancelled(request->cancellable)) return;
+  update = g_new0(trout_file_progress_update, 1);
+  update->request = trout_transfer_request_ref(request);
+  update->name = g_file_get_basename(source);
+  update->current_bytes = current_bytes;
+  update->total_bytes = total_bytes;
+  idle_source = g_idle_source_new();
+  g_source_set_callback(idle_source, trout_file_operation_progress_update, update, trout_file_operation_progress_update_destroy);
+  g_source_attach(idle_source, g_main_context_default());
+  g_source_unref(idle_source);
+}
+
+trout_file_collision_choice
+trout_transfer_request_collision(GFile *source, GFile *destination, GFileType source_type, GFileType destination_type, gpointer user_data)
+{
+  trout_transfer_request *request;
+  GSource *idle_source;
+  trout_file_collision_choice choice;
+  request = user_data;
+  g_mutex_lock(&request->collision.mutex);
+  if (g_cancellable_is_cancelled(request->cancellable)) {
+    g_mutex_unlock(&request->collision.mutex);
+    return trout_file_collision_cancel;
   }
-  if (request->pending == 0 && !request->starting) trout_transfer_request_finish(request);
+  request->collision.source = g_object_ref(source);
+  request->collision.destination = g_object_ref(destination);
+  request->collision.source_type = source_type;
+  request->collision.destination_type = destination_type;
+  request->collision.active = TRUE;
+  request->collision.choice_ready = FALSE;
+  request->collision.choice = trout_file_collision_cancel;
+  g_mutex_unlock(&request->collision.mutex);
+  idle_source = g_idle_source_new();
+  g_source_set_callback(idle_source, trout_transfer_request_show_collision, trout_transfer_request_ref(request), trout_transfer_request_unref);
+  g_source_attach(idle_source, g_main_context_default());
+  g_source_unref(idle_source);
+  g_mutex_lock(&request->collision.mutex);
+  while (!request->collision.choice_ready && !g_cancellable_is_cancelled(request->cancellable)) g_cond_wait(&request->collision.condition, &request->collision.mutex);
+  choice = request->collision.choice_ready ? request->collision.choice : trout_file_collision_cancel;
+  request->collision.choice_ready = FALSE;
+  request->collision.active = FALSE;
+  g_clear_object(&request->collision.source);
+  g_clear_object(&request->collision.destination);
+  g_mutex_unlock(&request->collision.mutex);
+  return choice;
+}
+
+gboolean
+trout_transfer_request_show_collision(gpointer user_data)
+{
+  trout_transfer_request *request;
+  GtkWidget *dialog;
+  GtkWidget *content;
+  GtkWidget *label;
+  GtkWidget *paths;
+  GtkWidget *buttons;
+  GtkWidget *skip_button;
+  GtkWidget *replace_button;
+  GtkWidget *cancel_button;
+  GFile *source;
+  GFile *destination;
+  GFileType destination_type;
+  char *destination_name;
+  char *source_path;
+  char *destination_path;
+  char *path_text;
+  char *message;
+  request = user_data;
+  g_mutex_lock(&request->collision.mutex);
+  if (!request->collision.active || g_cancellable_is_cancelled(request->cancellable)) {
+    g_mutex_unlock(&request->collision.mutex);
+    return FALSE;
+  }
+  source = g_object_ref(request->collision.source);
+  destination = g_object_ref(request->collision.destination);
+  destination_type = request->collision.destination_type;
+  g_mutex_unlock(&request->collision.mutex);
+  source_path = g_file_get_parse_name(source);
+  destination_path = g_file_get_parse_name(destination);
+  destination_name = g_file_get_basename(destination);
+  if (destination_type == G_FILE_TYPE_DIRECTORY) message = g_strdup_printf("An item named “%s” already exists. Replacing this directory will delete its contents.", destination_name);
+  else message = g_strdup_printf("An item named “%s” already exists in the destination.", destination_name);
+  dialog = gtk_window_new();
+  request->collision.dialog = dialog;
+  g_object_set_data(G_OBJECT(dialog), "trout_transfer_request", request);
+  gtk_window_set_title(GTK_WINDOW(dialog), "File Already Exists");
+  gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+  gtk_window_set_deletable(GTK_WINDOW(dialog), FALSE);
+  gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(request->window->window));
+  gtk_window_set_default_size(GTK_WINDOW(dialog), 460, -1);
+  content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(content, 12);
+  gtk_widget_set_margin_end(content, 12);
+  gtk_widget_set_margin_top(content, 12);
+  gtk_widget_set_margin_bottom(content, 12);
+  label = gtk_label_new(message);
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+  gtk_label_set_wrap(GTK_LABEL(label), TRUE);
+  path_text = g_strdup_printf("From: %s\nTo: %s", source_path, destination_path);
+  paths = gtk_label_new(path_text);
+  gtk_label_set_xalign(GTK_LABEL(paths), 0.0f);
+  gtk_label_set_wrap(GTK_LABEL(paths), TRUE);
+  gtk_label_set_selectable(GTK_LABEL(paths), TRUE);
+  gtk_box_append(GTK_BOX(content), label);
+  gtk_box_append(GTK_BOX(content), paths);
+  buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_widget_set_halign(buttons, GTK_ALIGN_END);
+  skip_button = gtk_button_new_with_label("Skip");
+  replace_button = gtk_button_new_with_label("Replace");
+  cancel_button = gtk_button_new_with_label(request->operation == trout_file_operation_copy ? "Cancel Copy" : "Cancel Move");
+  g_signal_connect(skip_button, "clicked", G_CALLBACK(trout_transfer_request_resolve_collision), GINT_TO_POINTER(trout_file_collision_skip));
+  g_signal_connect(replace_button, "clicked", G_CALLBACK(trout_transfer_request_resolve_collision), GINT_TO_POINTER(trout_file_collision_replace));
+  g_signal_connect(cancel_button, "clicked", G_CALLBACK(trout_transfer_request_resolve_collision), GINT_TO_POINTER(trout_file_collision_cancel));
+  gtk_box_append(GTK_BOX(buttons), skip_button);
+  gtk_box_append(GTK_BOX(buttons), replace_button);
+  gtk_box_append(GTK_BOX(buttons), cancel_button);
+  gtk_box_append(GTK_BOX(content), buttons);
+  gtk_window_set_child(GTK_WINDOW(dialog), content);
+  gtk_window_set_default_widget(GTK_WINDOW(dialog), skip_button);
+  gtk_widget_set_sensitive(request->window->transfer_pause_button, FALSE);
+  trout_transfer_request_update_label(request);
+  gtk_window_present(GTK_WINDOW(dialog));
+  g_object_unref(source);
+  g_object_unref(destination);
+  g_free(destination_name);
+  g_free(source_path);
+  g_free(destination_path);
+  g_free(path_text);
+  g_free(message);
+  return FALSE;
+}
+
+void
+trout_transfer_request_resolve_collision(GtkButton *button, gpointer user_data)
+{
+  GtkWidget *dialog;
+  trout_transfer_request *request;
+  trout_file_collision_choice choice;
+  dialog = GTK_WIDGET(gtk_widget_get_root(GTK_WIDGET(button)));
+  request = g_object_get_data(G_OBJECT(dialog), "trout_transfer_request");
+  choice = GPOINTER_TO_UINT(user_data);
+  trout_transfer_request_ref(request);
+  request->collision.dialog = 0;
+  gtk_window_destroy(GTK_WINDOW(dialog));
+  if (choice == trout_file_collision_cancel) trout_transfer_request_cancel(request);
+  else {
+    g_mutex_lock(&request->collision.mutex);
+    request->collision.choice = choice;
+    request->collision.choice_ready = TRUE;
+    request->collision.active = FALSE;
+    g_cond_broadcast(&request->collision.condition);
+    g_mutex_unlock(&request->collision.mutex);
+    if (request->window->active_transfer == request) {
+      gtk_widget_set_sensitive(request->window->transfer_pause_button, TRUE);
+      gtk_button_set_label(GTK_BUTTON(request->window->transfer_pause_button), request->paused ? "Resume" : "Pause");
+      trout_transfer_request_update_label(request);
+    }
+  }
+  trout_transfer_request_destroy(request);
 }
 
 void
 trout_transfer_request_update_label(trout_transfer_request *request)
 {
   guint queued_count;
+  gboolean paused;
+  gboolean collision_active;
   char *text;
   queued_count = g_queue_get_length(&request->window->transfer_queue);
-  if (request->paused) {
+  g_mutex_lock(&request->pause_mutex);
+  paused = request->paused;
+  g_mutex_unlock(&request->pause_mutex);
+  g_mutex_lock(&request->collision.mutex);
+  collision_active = request->collision.active;
+  g_mutex_unlock(&request->collision.mutex);
+  if (collision_active) {
+    if (queued_count > 0) text = g_strdup_printf("Waiting: %s %s · %u queued", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files", queued_count);
+    else text = g_strdup_printf("Waiting: %s %s", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files");
+  } else if (paused) {
     if (queued_count > 0) text = g_strdup_printf("Paused: %s %s · %u queued", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files", queued_count);
     else text = g_strdup_printf("Paused: %s %s", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files");
   } else if (queued_count > 0) text = g_strdup_printf("%s %s · %u queued", request->operation == trout_file_operation_copy ? "Copying" : "Moving", request->current_name != 0 ? request->current_name : "files", queued_count);
@@ -1337,9 +1439,7 @@ void
 trout_transfer_request_start_next(trout_window *window)
 {
   trout_transfer_request *request;
-  GFile *source;
-  GFile *destination;
-  guint index;
+  GTask *task;
   request = g_queue_pop_head(&window->transfer_queue);
   window->active_transfer = request;
   gtk_widget_set_sensitive(window->transfer_cancel_button, TRUE);
@@ -1347,44 +1447,39 @@ trout_transfer_request_start_next(trout_window *window)
   gtk_widget_set_sensitive(window->transfer_pause_button, TRUE);
   gtk_button_set_label(GTK_BUTTON(window->transfer_pause_button), "Pause");
   gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(window->transfer_progress), 0.0);
+  g_free(request->current_name);
+  request->current_name = g_strdup("files");
   trout_transfer_request_update_label(request);
-  request->starting = TRUE;
-  index = 0;
-  while (index < request->sources->len) {
-    source = g_ptr_array_index(request->sources, index);
-    destination = g_ptr_array_index(request->destinations, index);
-    trout_tab_start_file_operation(request->status_label, source, destination, request->operation, request);
-    index += 1;
-  }
-  request->starting = FALSE;
-  if (request->pending == 0) trout_transfer_request_finish(request);
+  task = g_task_new(0, request->cancellable, trout_transfer_request_complete, trout_transfer_request_ref(request));
+  g_task_set_task_data(task, request, 0);
+  g_task_run_in_thread(task, trout_transfer_request_worker);
+  g_object_unref(task);
 }
 
 void
-trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GPtrArray *sources, GPtrArray *destinations, guint operation)
+trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GPtrArray *operations, trout_file_operation operation)
 {
   trout_transfer_request *request;
   GtkWidget *content;
   GtkWidget *buttons;
   GtkWidget *pause_button;
   GtkWidget *cancel_button;
-  if (sources->len == 0) {
-    g_ptr_array_unref(sources);
-    g_ptr_array_unref(destinations);
+  if (operations->len == 0) {
+    g_ptr_array_unref(operations);
     return;
   }
   request = g_new0(trout_transfer_request, 1);
   request->window = window;
   request->window_widget = g_object_ref(window->window);
   request->status_label = g_object_ref(status_label);
-  request->sources = sources;
-  request->destinations = destinations;
+  request->operations = operations;
   request->operation = operation;
   request->cancellable = g_cancellable_new();
   request->references = 1;
-  g_queue_init(&request->deferred_operations);
   g_mutex_init(&request->pause_mutex);
   g_cond_init(&request->pause_condition);
+  g_mutex_init(&request->collision.mutex);
+  g_cond_init(&request->collision.condition);
   g_queue_push_tail(&window->transfer_queue, request);
   if (window->transfer_dialog == 0) {
     window->transfer_dialog = gtk_window_new();
@@ -1420,27 +1515,41 @@ trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GP
 }
 
 void
+trout_transfer_request_cancel(trout_transfer_request *request)
+{
+  GtkWidget *dialog;
+  g_cancellable_cancel(request->cancellable);
+  trout_transfer_request_release_pause(request);
+  g_mutex_lock(&request->collision.mutex);
+  request->collision.choice = trout_file_collision_cancel;
+  request->collision.choice_ready = TRUE;
+  request->collision.active = FALSE;
+  g_cond_broadcast(&request->collision.condition);
+  g_mutex_unlock(&request->collision.mutex);
+  dialog = request->collision.dialog;
+  request->collision.dialog = 0;
+  if (dialog != 0) gtk_window_destroy(GTK_WINDOW(dialog));
+  if (request->window->active_transfer == request) {
+    gtk_widget_set_sensitive(request->window->transfer_pause_button, FALSE);
+    gtk_widget_set_sensitive(request->window->transfer_cancel_button, FALSE);
+    gtk_button_set_label(GTK_BUTTON(request->window->transfer_cancel_button), "Cancelling…");
+  }
+}
+
+void
 trout_transfer_pause(GtkButton *button, gpointer user_data)
 {
   trout_window *window;
   trout_transfer_request *request;
-  gboolean paused;
   window = user_data;
   request = window->active_transfer;
   if (request != 0) {
     g_mutex_lock(&request->pause_mutex);
-    paused = request->paused;
-    request->paused = !paused;
+    request->paused = !request->paused;
     g_cond_broadcast(&request->pause_condition);
     g_mutex_unlock(&request->pause_mutex);
-    if (paused) {
-      gtk_button_set_label(button, "Pause");
-      trout_transfer_request_update_label(request);
-      trout_transfer_request_resume_deferred(request);
-    } else {
-      gtk_button_set_label(button, "Resume");
-      trout_transfer_request_update_label(request);
-    }
+    gtk_button_set_label(button, request->paused ? "Resume" : "Pause");
+    trout_transfer_request_update_label(request);
   }
 }
 
@@ -1451,38 +1560,8 @@ trout_transfer_cancel(GtkButton *button, gpointer user_data)
   trout_transfer_request *request;
   window = user_data;
   request = window->active_transfer;
-  if (request != 0) {
-    gtk_button_set_label(button, "Cancelling…");
-    gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
-    gtk_widget_set_sensitive(window->transfer_pause_button, FALSE);
-    g_cancellable_cancel(request->cancellable);
-    trout_transfer_request_release_pause(request);
-    trout_transfer_request_discard_deferred(request);
-  }
-}
-
-void
-trout_file_operation_progress(goffset current_bytes, goffset total_bytes, gpointer user_data)
-{
-  trout_file_job *job;
-  trout_transfer_request *request;
-  trout_file_progress_update *update;
-  GSource *idle_source;
-  job = user_data;
-  request = job->transfer_request;
-  g_mutex_lock(&request->pause_mutex);
-  while (request->paused && !g_cancellable_is_cancelled(request->cancellable)) g_cond_wait(&request->pause_condition, &request->pause_mutex);
-  g_mutex_unlock(&request->pause_mutex);
-  if (g_cancellable_is_cancelled(request->cancellable)) return;
-  update = g_new0(trout_file_progress_update, 1);
-  update->request = trout_transfer_request_ref(request);
-  update->name = g_file_get_basename(job->source);
-  update->current_bytes = current_bytes;
-  update->total_bytes = total_bytes;
-  idle_source = g_idle_source_new();
-  g_source_set_callback(idle_source, trout_file_operation_progress_update, update, trout_file_operation_progress_update_destroy);
-  g_source_attach(idle_source, g_main_context_default());
-  g_source_unref(idle_source);
+  if (request != 0) trout_transfer_request_cancel(request);
+  (void)button;
 }
 
 gboolean
@@ -1513,25 +1592,63 @@ trout_file_operation_progress_update_destroy(gpointer user_data)
 }
 
 void
-trout_file_operation_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+trout_transfer_request_unref(gpointer user_data)
 {
-  trout_file_job *job;
+  trout_transfer_request_destroy(user_data);
+}
+
+void
+trout_transfer_request_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+{
+  trout_transfer_request *request;
+  trout_file_transfer_callbacks callbacks;
   GError *error;
   gboolean succeeded;
-  job = task_data;
+  request = task_data;
+  callbacks.user_data = request;
+  callbacks.wait = trout_transfer_request_wait;
+  callbacks.collision = trout_transfer_request_collision;
+  callbacks.progress = trout_transfer_request_progress;
   error = 0;
-  if (job->operation == trout_file_operation_copy) succeeded = g_file_copy(job->source, job->destination, G_FILE_COPY_NONE, cancellable, trout_file_operation_progress, job, &error);
-  else succeeded = g_file_move(job->source, job->destination, G_FILE_COPY_NONE, cancellable, trout_file_operation_progress, job, &error);
+  succeeded = trout_file_transfer_execute(request->operations, request->operation, cancellable, &callbacks, &error);
   if (succeeded) g_task_return_boolean(task, TRUE);
   else g_task_return_error(task, error);
   (void)source_object;
 }
 
 void
-trout_tab_start_delete_operation(GtkWidget *status_label, GFile *source, trout_file_job *parent)
+trout_transfer_request_complete(GObject *source, GAsyncResult *result, gpointer user_data)
 {
-  trout_file_job *job;
-  job = g_new0(trout_file_job, 1);
+  trout_transfer_request *request;
+  GError *error;
+  gboolean succeeded;
+  request = user_data;
+  error = 0;
+  succeeded = g_task_propagate_boolean(G_TASK(result), &error);
+  if (!succeeded && error != 0 && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_RECURSE)) gtk_label_set_text(GTK_LABEL(request->status_label), "Cannot copy a directory into itself or one of its subdirectories");
+    else trout_tab_show_error(request->status_label, error);
+  }
+  if (error != 0) g_error_free(error);
+  trout_transfer_request_finish(request);
+  trout_transfer_request_destroy(request);
+  (void)source;
+}
+
+void
+trout_tab_delete_job_destroy(trout_delete_job *job)
+{
+  g_object_unref(job->status_label);
+  g_object_unref(job->source);
+  if (job->enumerator != 0) g_object_unref(job->enumerator);
+  g_free(job);
+}
+
+void
+trout_tab_start_delete_operation(GtkWidget *status_label, GFile *source, trout_delete_job *parent)
+{
+  trout_delete_job *job;
+  job = g_new0(trout_delete_job, 1);
   job->status_label = g_object_ref(status_label);
   job->source = g_object_ref(source);
   job->parent = parent;
@@ -1540,11 +1657,11 @@ trout_tab_start_delete_operation(GtkWidget *status_label, GFile *source, trout_f
 }
 
 void
-trout_tab_delete_job_finish(trout_file_job *job, gboolean failed)
+trout_tab_delete_job_finish(trout_delete_job *job, gboolean failed)
 {
-  trout_file_job *parent;
+  trout_delete_job *parent;
   parent = job->parent;
-  trout_tab_file_job_destroy(job);
+  trout_tab_delete_job_destroy(job);
   if (parent != 0) {
     if (failed) parent->delete_failed = TRUE;
     parent->pending_children -= 1;
@@ -1558,7 +1675,7 @@ trout_tab_delete_job_finish(trout_file_job *job, gboolean failed)
 void
 trout_tab_delete_operation_complete(GObject *source, GAsyncResult *result, gpointer user_data)
 {
-  trout_file_job *job;
+  trout_delete_job *job;
   GError *error;
   gboolean succeeded;
   job = user_data;
@@ -1584,7 +1701,7 @@ trout_tab_delete_operation_complete(GObject *source, GAsyncResult *result, gpoin
 void
 trout_tab_delete_directory_enumerated(GObject *source, GAsyncResult *result, gpointer user_data)
 {
-  trout_file_job *job;
+  trout_delete_job *job;
   GError *error;
   job = user_data;
   error = 0;
@@ -1603,7 +1720,7 @@ trout_tab_delete_directory_enumerated(GObject *source, GAsyncResult *result, gpo
 void
 trout_tab_delete_directory_next_files(GObject *source, GAsyncResult *result, gpointer user_data)
 {
-  trout_file_job *job;
+  trout_delete_job *job;
   GList *file_infos;
   GList *file_info_node;
   GFileInfo *file_info;
@@ -1644,80 +1761,6 @@ trout_tab_delete_directory_next_files(GObject *source, GAsyncResult *result, gpo
   }
   g_list_free(file_infos);
   g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, 0, trout_tab_delete_directory_next_files, job);
-}
-
-void
-trout_tab_copy_directory_created(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-  trout_file_job *job;
-  GError *error;
-  gboolean succeeded;
-  job = user_data;
-  error = 0;
-  succeeded = g_file_make_directory_finish(G_FILE(source), result, &error);
-  if (!succeeded) {
-    if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) trout_tab_show_error(job->status_label, error);
-    g_error_free(error);
-    trout_tab_file_job_destroy(job);
-    return;
-  }
-  g_file_enumerate_children_async(job->source, "standard::name", G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_enumerated, job);
-}
-
-void
-trout_tab_copy_directory_enumerated(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-  trout_file_job *job;
-  GError *error;
-  job = user_data;
-  error = 0;
-  job->enumerator = g_file_enumerate_children_finish(G_FILE(source), result, &error);
-  if (job->enumerator == 0) {
-    if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) trout_tab_show_error(job->status_label, error);
-    g_error_free(error);
-    trout_tab_file_job_destroy(job);
-    return;
-  }
-  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_next_files, job);
-}
-
-void
-trout_tab_copy_directory_next_files(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-  trout_file_job *job;
-  GList *file_infos;
-  GList *file_info_node;
-  GFileInfo *file_info;
-  GFile *source_file;
-  GFile *destination_file;
-  char *name;
-  GError *error;
-  job = user_data;
-  error = 0;
-  file_infos = g_file_enumerator_next_files_finish(G_FILE_ENUMERATOR(source), result, &error);
-  if (file_infos == 0) {
-    if (error != 0) {
-      if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) trout_tab_show_error(job->status_label, error);
-      g_error_free(error);
-    }
-    trout_tab_file_job_destroy(job);
-    return;
-  }
-  file_info_node = file_infos;
-  while (file_info_node != 0) {
-    file_info = file_info_node->data;
-    name = g_strdup(g_file_info_get_name(file_info));
-    source_file = g_file_get_child(job->source, name);
-    destination_file = g_file_get_child(job->destination, name);
-    trout_tab_start_file_operation(job->status_label, source_file, destination_file, trout_file_operation_copy, job->transfer_request);
-    g_object_unref(source_file);
-    g_object_unref(destination_file);
-    g_free(name);
-    g_object_unref(file_info);
-    file_info_node = file_info_node->next;
-  }
-  g_list_free(file_infos);
-  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, job->transfer_request->cancellable, trout_tab_copy_directory_next_files, job);
 }
 
 void
@@ -1834,9 +1877,9 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
   GFile *destination;
   char *name;
   GError *error;
-  GPtrArray *sources;
-  GPtrArray *destinations;
-  guint operation;
+  GPtrArray *operations;
+  trout_file_transfer_pair *pair;
+  trout_file_operation operation;
   read_data = user_data;
   error = 0;
   chunk = g_input_stream_read_bytes_finish(G_INPUT_STREAM(source), result, &error);
@@ -1861,8 +1904,7 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
   if (g_str_has_prefix(contents, "cut\n")) uris_text += 4;
   else if (g_str_has_prefix(contents, "copy\n")) uris_text += 5;
   uris = g_uri_list_extract_uris(uris_text);
-  sources = g_ptr_array_new_with_free_func(g_object_unref);
-  destinations = g_ptr_array_new_with_free_func(g_object_unref);
+  operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
   operation = g_str_has_prefix(contents, "cut\n") ? trout_file_operation_move : trout_file_operation_copy;
   uri = uris;
   while (uri != 0 && *uri != 0) {
@@ -1871,8 +1913,8 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
     if (name != 0) {
       destination = g_file_get_child(read_data->destination, name);
       if (!g_file_equal(file, destination)) {
-        g_ptr_array_add(sources, g_object_ref(file));
-        g_ptr_array_add(destinations, g_object_ref(destination));
+        pair = trout_file_transfer_pair_new(file, destination);
+        g_ptr_array_add(operations, pair);
       }
       g_object_unref(destination);
       g_free(name);
@@ -1880,7 +1922,7 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
     g_object_unref(file);
     uri += 1;
   }
-  trout_transfer_request_enqueue(read_data->window, read_data->status_label, sources, destinations, operation);
+  trout_transfer_request_enqueue(read_data->window, read_data->status_label, operations, operation);
   g_strfreev(uris);
   g_free(contents);
   trout_tab_clipboard_read_destroy(read_data);
@@ -1924,8 +1966,8 @@ trout_tab_rename_accept(GtkWidget *widget, gpointer user_data)
   GtkWidget *dialog;
   GFile *parent;
   GFile *destination;
-  GPtrArray *sources;
-  GPtrArray *destinations;
+  GPtrArray *operations;
+  trout_file_transfer_pair *pair;
   trout_window *window;
   char *name;
   rename_data = user_data;
@@ -1935,12 +1977,11 @@ trout_tab_rename_accept(GtkWidget *widget, gpointer user_data)
     parent = g_file_get_parent(rename_data->source);
     destination = g_file_get_child(parent, name);
     if (!g_file_equal(rename_data->source, destination)) {
-      sources = g_ptr_array_new_with_free_func(g_object_unref);
-      destinations = g_ptr_array_new_with_free_func(g_object_unref);
-      g_ptr_array_add(sources, g_object_ref(rename_data->source));
-      g_ptr_array_add(destinations, g_object_ref(destination));
+      operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
+      pair = trout_file_transfer_pair_new(rename_data->source, destination);
+      g_ptr_array_add(operations, pair);
       window = g_object_get_data(G_OBJECT(gtk_widget_get_root(rename_data->status_label)), "trout_window");
-      trout_transfer_request_enqueue(window, rename_data->status_label, sources, destinations, trout_file_operation_move);
+      trout_transfer_request_enqueue(window, rename_data->status_label, operations, trout_file_operation_move);
     }
     g_object_unref(destination);
     g_object_unref(parent);
@@ -2796,6 +2837,7 @@ trout_application_open(GApplication *application, GFile **files, gint file_count
   (void)user_data;
 }
 
+#ifndef trout_test_build
 int
 main(int argument_count, char **argument_vector)
 {
@@ -2822,3 +2864,4 @@ main(int argument_count, char **argument_vector)
   g_object_unref(application);
   return result;
 }
+#endif
