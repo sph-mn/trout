@@ -2,17 +2,24 @@
 
 Trout is a GTK4 file manager for local directories.
 
+![](other/trout.png)
+
 Features
 * Fast with large directories (10k+ files)
 * Fast and immediate thumbnail generation
 * Custom right-click actions
 * Custom action buttons
-* Fast directory overwrites
-
-To be implemented:
-* Queued file operations
+* Directory copies merge into existing directories with the same name
+* Copy and move collisions offer Skip, Replace, and Cancel
+* Queued copy and move tasks with progress, pause, resume, and cancel
 
 The first implementation provides asynchronous monitored directory listings, a compact horizontal browser, breadcrumb navigation with an editable location field, Ctrl+wheel zoom, tabs, new windows, hidden file toggling, and an item selection status line.
+
+## File operations
+
+Copying a directory into an existing directory with the same name merges their contents recursively. Existing files and paths that cannot be merged prompt for Skip, Replace, or Cancel. Replace overwrites conflicting files; when the source and destination have different types, it removes the destination before installing the source.
+
+Copy and move requests run in a queue. The active request shows progress and can be paused, resumed, or canceled.
 
 ## Custom actions
 

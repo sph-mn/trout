@@ -122,8 +122,8 @@ trout_file_transfer_entry(GFile *source, GFile *destination, trout_file_operatio
   if (source_info == 0) return FALSE;
   source_type = g_file_info_get_file_type(source_info);
   g_object_unref(source_info);
-  if (operation == trout_file_operation_copy && source_type == G_FILE_TYPE_DIRECTORY && g_file_has_prefix(destination, source)) {
-    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_WOULD_RECURSE, "Cannot copy a directory into itself or one of its subdirectories");
+  if (source_type == G_FILE_TYPE_DIRECTORY && g_file_has_prefix(destination, source)) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_WOULD_RECURSE, "Cannot transfer a directory into itself or one of its subdirectories");
     return FALSE;
   }
   attempt = 0;
