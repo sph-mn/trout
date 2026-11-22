@@ -19,6 +19,7 @@
 #define trout_zoom_level_initial 0
 #define trout_zoom_level_step 1
 #define trout_zoom_save_delay_milliseconds 5000
+#define trout_action_button_update_delay_milliseconds 500
 #define trout_action_appearance_context 1
 #define trout_action_appearance_button 2
 #define trout_action_type_directories 1
@@ -29,9 +30,13 @@
 #define trout_icon_size_minimum 16
 #define trout_compact_max_rows 128
 #define trout_typeahead_timeout_milliseconds 5000
-#define trout_sort_name 0
-#define trout_sort_modified 1
-#define trout_sort_size 2
+#define trout_sort_name_descending 0
+#define trout_sort_name_ascending 1
+#define trout_sort_modified_descending 2
+#define trout_sort_modified_ascending 3
+#define trout_sort_size_descending 4
+#define trout_sort_size_ascending 5
+#define trout_sort_order_count 6
 #define trout_application_id "org.trout.file-manager"
 #define trout_compact_css \
   "gridview.trout_compact { padding: 3px; border-spacing: 6px 0; }" \
@@ -73,11 +78,10 @@ struct trout_window {
   GtkWidget *notebook;
   GtkWidget *location_box;
   GtkWidget *custom_action_box;
+  guint custom_action_timeout_id;
   GtkWidget *hidden_button;
   GtkWidget *action_popover;
-  GtkWidget *sort_name_button;
-  GtkWidget *sort_modified_button;
-  GtkWidget *sort_size_button;
+  GtkWidget *sort_buttons[trout_sort_order_count];
   gboolean updating_sort_menu;
   GtkWidget *transfer_dialog;
   GtkWidget *transfer_label;
@@ -117,6 +121,7 @@ struct trout_tab {
   gboolean completion_has_suffix;
   gboolean completion_highlight;
   gboolean completion_suppressed;
+  guint completion_source_id;
 };
 
 struct trout_delete_job {
@@ -187,7 +192,13 @@ void trout_tab_select_typeahead_match(trout_tab *tab);
 void trout_tab_set_directory(trout_tab *tab, GFile *directory);
 void trout_tab_edit_location(trout_tab *tab);
 void trout_tab_complete_location(trout_tab *tab, gboolean highlight);
+void trout_tab_schedule_location_completion(trout_tab *tab, gboolean highlight);
+gboolean trout_tab_complete_location_idle(gpointer user_data);
+void trout_tab_cancel_location_completion(trout_tab *tab);
 void trout_window_update_custom_actions(trout_window *window);
+void trout_window_apply_custom_actions(trout_window *window);
+gboolean trout_window_update_custom_actions_timeout(gpointer user_data);
+void trout_window_destroy(gpointer user_data);
 gboolean trout_action_matches_selection(trout_action *action, trout_tab *tab);
 gboolean trout_action_matches_file(trout_action *action, GFileInfo *file_info);
 void trout_action_activate(GtkButton *button, gpointer user_data);
@@ -195,6 +206,7 @@ void trout_action_child_exited(GPid process_id, gint wait_status, gpointer user_
 GtkWidget *trout_action_make_button(trout_action *action, trout_window *window, GtkWidget *popover);
 void trout_window_sort_toggled(GtkCheckButton *button, gpointer user_data);
 void trout_window_update_sort_menu(trout_window *window, trout_tab *tab);
+void trout_window_set_menu_item_label(GtkWidget *item, char *text);
 void trout_tab_set_sort_order(trout_tab *tab, guint sort_order);
 void trout_window_add_tab(trout_window *window, GFile *directory);
 GtkWidget *trout_window_create(GtkApplication *application, GFile *directory);
@@ -543,6 +555,23 @@ trout_action_make_button(trout_action *action, trout_window *window, GtkWidget *
 void
 trout_window_update_custom_actions(trout_window *window)
 {
+  if (window->custom_action_timeout_id != 0) g_source_remove(window->custom_action_timeout_id);
+  window->custom_action_timeout_id = g_timeout_add(trout_action_button_update_delay_milliseconds, trout_window_update_custom_actions_timeout, window);
+}
+
+gboolean
+trout_window_update_custom_actions_timeout(gpointer user_data)
+{
+  trout_window *window;
+  window = user_data;
+  window->custom_action_timeout_id = 0;
+  trout_window_apply_custom_actions(window);
+  return FALSE;
+}
+
+void
+trout_window_apply_custom_actions(trout_window *window)
+{
   trout_tab *tab;
   trout_action *action;
   GtkWidget *button;
@@ -553,6 +582,15 @@ trout_window_update_custom_actions(trout_window *window)
     gtk_widget_set_visible(button, tab != 0 && trout_action_matches_selection(action, tab));
     button = gtk_widget_get_next_sibling(button);
   }
+}
+
+void
+trout_window_destroy(gpointer user_data)
+{
+  trout_window *window;
+  window = user_data;
+  if (window->custom_action_timeout_id != 0) g_source_remove(window->custom_action_timeout_id);
+  g_free(window);
 }
 
 void
@@ -657,13 +695,6 @@ trout_file_sort_group(GFileInfo *file_info, gpointer user_data)
   return g_file_info_get_file_type(file_info) != G_FILE_TYPE_DIRECTORY;
 }
 
-char *
-trout_file_sort_name(GFileInfo *file_info, gpointer user_data)
-{
-  (void)user_data;
-  return g_strdup(g_file_info_get_display_name(file_info));
-}
-
 guint64
 trout_file_sort_modified(GFileInfo *file_info, gpointer user_data)
 {
@@ -682,32 +713,56 @@ trout_file_sort_size(GFileInfo *file_info, gpointer user_data)
   return g_file_info_get_size(file_info);
 }
 
+gint
+trout_file_sort_name_compare(gconstpointer left, gconstpointer right, gpointer user_data)
+{
+  GFileInfo *left_info;
+  GFileInfo *right_info;
+  char *left_name;
+  char *right_name;
+  gint comparison;
+  gboolean descending;
+  left_info = (GFileInfo *)left;
+  right_info = (GFileInfo *)right;
+  left_name = (char *)g_file_info_get_display_name(left_info);
+  right_name = (char *)g_file_info_get_display_name(right_info);
+  comparison = g_utf8_collate(left_name, right_name);
+  descending = user_data != 0;
+  if (comparison < 0) return descending ? 1 : -1;
+  if (comparison > 0) return descending ? -1 : 1;
+  return 0;
+}
+
 GtkSorter *
 trout_create_file_sorter(guint sort_order)
 {
   GtkMultiSorter *sorter;
   GtkExpression *group_expression;
   GtkExpression *sort_expression;
-  GtkStringSorter *name_sorter;
+  GtkCustomSorter *name_sorter;
   GtkNumericSorter *numeric_sorter;
+  GtkSortType sort_direction;
+  gboolean modified_sort;
+  gboolean size_sort;
+  gboolean descending;
   sorter = gtk_multi_sorter_new();
   group_expression = gtk_cclosure_expression_new(G_TYPE_INT, 0, 0, 0, G_CALLBACK(trout_file_sort_group), 0, 0);
   gtk_multi_sorter_append(sorter, GTK_SORTER(gtk_numeric_sorter_new(group_expression)));
-  if (sort_order == trout_sort_modified) sort_expression = gtk_cclosure_expression_new(G_TYPE_UINT64, 0, 0, 0, G_CALLBACK(trout_file_sort_modified), 0, 0);
-  else if (sort_order == trout_sort_size) sort_expression = gtk_cclosure_expression_new(G_TYPE_INT64, 0, 0, 0, G_CALLBACK(trout_file_sort_size), 0, 0);
-  else sort_expression = gtk_cclosure_expression_new(G_TYPE_STRING, 0, 0, 0, G_CALLBACK(trout_file_sort_name), 0, 0);
-  if (sort_order == trout_sort_name) {
-    name_sorter = gtk_string_sorter_new(sort_expression);
-    gtk_string_sorter_set_ignore_case(name_sorter, FALSE);
-    gtk_string_sorter_set_collation(name_sorter, GTK_COLLATION_UNICODE);
+  modified_sort = sort_order == trout_sort_modified_descending || sort_order == trout_sort_modified_ascending;
+  size_sort = sort_order == trout_sort_size_descending || sort_order == trout_sort_size_ascending;
+  descending = sort_order == trout_sort_name_descending || sort_order == trout_sort_modified_descending || sort_order == trout_sort_size_descending;
+  sort_direction = descending ? GTK_SORT_DESCENDING : GTK_SORT_ASCENDING;
+  if (modified_sort) sort_expression = gtk_cclosure_expression_new(G_TYPE_UINT64, 0, 0, 0, G_CALLBACK(trout_file_sort_modified), 0, 0);
+  else if (size_sort) sort_expression = gtk_cclosure_expression_new(G_TYPE_INT64, 0, 0, 0, G_CALLBACK(trout_file_sort_size), 0, 0);
+  else sort_expression = 0;
+  if (!modified_sort && !size_sort) {
+    name_sorter = gtk_custom_sorter_new(trout_file_sort_name_compare, GINT_TO_POINTER(descending), 0);
     gtk_multi_sorter_append(sorter, GTK_SORTER(name_sorter));
   } else {
     numeric_sorter = gtk_numeric_sorter_new(sort_expression);
-    gtk_numeric_sorter_set_sort_order(numeric_sorter, GTK_SORT_DESCENDING);
+    gtk_numeric_sorter_set_sort_order(numeric_sorter, sort_direction);
     gtk_multi_sorter_append(sorter, GTK_SORTER(numeric_sorter));
-    name_sorter = gtk_string_sorter_new(gtk_cclosure_expression_new(G_TYPE_STRING, 0, 0, 0, G_CALLBACK(trout_file_sort_name), 0, 0));
-    gtk_string_sorter_set_ignore_case(name_sorter, FALSE);
-    gtk_string_sorter_set_collation(name_sorter, GTK_COLLATION_UNICODE);
+    name_sorter = gtk_custom_sorter_new(trout_file_sort_name_compare, 0, 0);
     gtk_multi_sorter_append(sorter, GTK_SORTER(name_sorter));
   }
   return GTK_SORTER(sorter);
@@ -907,6 +962,7 @@ trout_tab_update_location(trout_tab *tab)
 void
 trout_tab_set_directory(trout_tab *tab, GFile *directory)
 {
+  trout_tab_cancel_location_completion(tab);
   trout_tab_clear_typeahead(tab);
   if (tab->directory != 0) g_object_unref(tab->directory);
   tab->directory = g_object_ref(directory);
@@ -965,11 +1021,13 @@ trout_tab_on_location_key(GtkEventControllerKey *controller, guint keyval, guint
   tab = user_data;
   if (keyval == GDK_KEY_Tab && (state & GDK_CONTROL_MASK) == 0 && gtk_editable_get_position(GTK_EDITABLE(tab->location_entry)) == gtk_entry_get_text_length(GTK_ENTRY(tab->location_entry))) {
     if (!tab->completion_has_suffix) {
-      tab->completion_highlight = FALSE;
-      trout_tab_complete_location(tab, FALSE);
+      tab->completion_has_suffix = FALSE;
+      trout_tab_schedule_location_completion(tab, FALSE);
+    } else {
+      trout_tab_cancel_location_completion(tab);
+      tab->completion_has_suffix = FALSE;
+      gtk_editable_set_position(GTK_EDITABLE(tab->location_entry), -1);
     }
-    tab->completion_has_suffix = FALSE;
-    gtk_editable_set_position(GTK_EDITABLE(tab->location_entry), -1);
     return TRUE;
   }
   if (keyval != GDK_KEY_Escape) return FALSE;
@@ -983,6 +1041,7 @@ trout_tab_on_location_focus_leave(GtkEventControllerFocus *controller, gpointer 
 {
   trout_tab *tab;
   tab = user_data;
+  trout_tab_cancel_location_completion(tab);
   gtk_stack_set_visible_child_name(GTK_STACK(tab->location_stack), "buttons");
   (void)controller;
 }
@@ -992,6 +1051,7 @@ trout_tab_edit_location(trout_tab *tab)
 {
   char *path;
   trout_tab_clear_typeahead(tab);
+  trout_tab_cancel_location_completion(tab);
   path = g_file_get_path(tab->directory);
   if (path == 0) path = g_file_get_uri(tab->directory);
   tab->completion_suppressed = TRUE;
@@ -1001,6 +1061,32 @@ trout_tab_edit_location(trout_tab *tab)
   gtk_widget_grab_focus(tab->location_entry);
   gtk_editable_select_region(GTK_EDITABLE(tab->location_entry), 0, -1);
   g_free(path);
+}
+
+void
+trout_tab_schedule_location_completion(trout_tab *tab, gboolean highlight)
+{
+  tab->completion_highlight = highlight;
+  if (tab->completion_source_id == 0) tab->completion_source_id = g_idle_add(trout_tab_complete_location_idle, tab);
+}
+
+gboolean
+trout_tab_complete_location_idle(gpointer user_data)
+{
+  trout_tab *tab;
+  tab = user_data;
+  tab->completion_source_id = 0;
+  if (!tab->completion_suppressed && !tab->completion_has_suffix) trout_tab_complete_location(tab, tab->completion_highlight);
+  return G_SOURCE_REMOVE;
+}
+
+void
+trout_tab_cancel_location_completion(trout_tab *tab)
+{
+  if (tab->completion_source_id != 0) {
+    g_source_remove(tab->completion_source_id);
+    tab->completion_source_id = 0;
+  }
 }
 
 void
@@ -1027,16 +1113,16 @@ trout_tab_complete_location(trout_tab *tab, gboolean highlight)
   }
   if (g_str_has_prefix(text, "~/")) completion_text = g_build_filename(g_get_home_dir(), text + 2, (char *)0);
   else completion_text = g_strdup(text);
+  tab->completion_suppressed = TRUE;
   suffix = g_filename_completer_get_completion_suffix(tab->filename_completer, completion_text);
   if (suffix != 0 && suffix[0] != '\0') {
     text_length = g_utf8_strlen(text, -1);
-    tab->completion_suppressed = TRUE;
     gtk_editable_insert_text(editable, suffix, -1, &cursor_position);
     if (highlight) gtk_editable_select_region(editable, text_length, -1);
     else gtk_editable_set_position(editable, cursor_position);
-    tab->completion_suppressed = FALSE;
     tab->completion_has_suffix = highlight;
   }
+  tab->completion_suppressed = FALSE;
   g_free(suffix);
   g_free(completion_text);
   g_free(text);
@@ -1049,8 +1135,7 @@ trout_tab_on_location_changed(GtkEditable *editable, gpointer user_data)
   tab = user_data;
   if (tab->completion_suppressed) return;
   tab->completion_has_suffix = FALSE;
-  tab->completion_highlight = TRUE;
-  trout_tab_complete_location(tab, TRUE);
+  trout_tab_schedule_location_completion(tab, TRUE);
   (void)editable;
 }
 
@@ -1069,7 +1154,9 @@ trout_tab_on_completion_data(GFilenameCompleter *completer, gpointer user_data)
 {
   trout_tab *tab;
   tab = user_data;
-  if (!tab->completion_suppressed && !tab->completion_has_suffix) trout_tab_complete_location(tab, tab->completion_highlight);
+  if (gtk_widget_has_focus(tab->location_entry) && !tab->completion_suppressed && !tab->completion_has_suffix) {
+    trout_tab_schedule_location_completion(tab, tab->completion_highlight);
+  }
   (void)completer;
 }
 
@@ -2373,6 +2460,7 @@ trout_tab_destroy(gpointer user_data)
   trout_tab *tab;
   tab = user_data;
   if (tab->typeahead_timeout_id != 0) g_source_remove(tab->typeahead_timeout_id);
+  trout_tab_cancel_location_completion(tab);
   g_string_free(tab->typeahead_prefix, TRUE);
   if (tab->context_file != 0) g_object_unref(tab->context_file);
   g_object_unref(tab->filename_completer);
@@ -2401,6 +2489,7 @@ trout_tab_create(trout_window *window, GFile *directory)
   tab->directory = g_object_ref(directory);
   preferences = g_object_get_data(G_OBJECT(window->application), "trout_preferences");
   tab->zoom_level = preferences->zoom_level;
+  tab->sort_order = trout_sort_name_descending;
   tab->icon_size = trout_zoom_icon_size(tab->zoom_level);
   tab->typeahead_prefix = g_string_new(0);
   tab->filename_completer = g_filename_completer_new();
@@ -2592,11 +2681,25 @@ GtkWidget *
 trout_window_make_action_button(char *label, char *action_name, trout_window *window)
 {
   GtkWidget *button;
-  button = gtk_button_new_with_label(label);
+  button = gtk_button_new();
+  trout_window_set_menu_item_label(button, label);
   g_object_set_data(G_OBJECT(button), "trout_action", (gpointer)action_name);
   g_object_set_data(G_OBJECT(button), "trout_popover", window->action_popover);
   g_signal_connect(button, "clicked", G_CALLBACK(trout_window_action_button), window->window);
   return button;
+}
+
+void
+trout_window_set_menu_item_label(GtkWidget *item, char *text)
+{
+  GtkWidget *label;
+  label = gtk_label_new(text);
+  gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+  gtk_widget_set_hexpand(label, TRUE);
+  if (GTK_IS_CHECK_BUTTON(item)) gtk_check_button_set_child(GTK_CHECK_BUTTON(item), label);
+  else gtk_button_set_child(GTK_BUTTON(item), label);
+  gtk_widget_set_halign(item, GTK_ALIGN_FILL);
+  gtk_widget_set_hexpand(item, TRUE);
 }
 
 void
@@ -2616,10 +2719,13 @@ trout_window_sort_toggled(GtkCheckButton *button, gpointer user_data)
 void
 trout_window_update_sort_menu(trout_window *window, trout_tab *tab)
 {
+  guint sort_index;
   window->updating_sort_menu = TRUE;
-  gtk_check_button_set_active(GTK_CHECK_BUTTON(window->sort_name_button), tab->sort_order == trout_sort_name);
-  gtk_check_button_set_active(GTK_CHECK_BUTTON(window->sort_modified_button), tab->sort_order == trout_sort_modified);
-  gtk_check_button_set_active(GTK_CHECK_BUTTON(window->sort_size_button), tab->sort_order == trout_sort_size);
+  sort_index = 0;
+  while (sort_index < trout_sort_order_count) {
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(window->sort_buttons[sort_index]), tab->sort_order == sort_index);
+    sort_index += 1;
+  }
   window->updating_sort_menu = FALSE;
 }
 
@@ -2637,7 +2743,16 @@ trout_window_create(GtkApplication *application, GFile *directory)
   GPtrArray *actions;
   trout_action *action;
   guint action_index;
+  guint sort_index;
   GtkEventController *keys;
+  char *sort_labels[trout_sort_order_count] = {
+    "Sort by name descending",
+    "Sort by name ascending",
+    "Sort by modification time descending",
+    "Sort by modification time ascending",
+    "Sort by size descending",
+    "Sort by size ascending"
+  };
   window = g_new0(trout_window, 1);
   window->application = application;
   window->thumbnailer = g_object_get_data(G_OBJECT(application), "trout_thumbnailer");
@@ -2645,7 +2760,7 @@ trout_window_create(GtkApplication *application, GFile *directory)
   g_queue_init(&window->transfer_queue);
   window->clipboard = gdk_display_get_clipboard(gtk_widget_get_display(window->window));
   window->notebook = gtk_notebook_new();
-  g_object_set_data_full(G_OBJECT(window->window), "trout_window", window, g_free);
+  g_object_set_data_full(G_OBJECT(window->window), "trout_window", window, trout_window_destroy);
   gtk_window_set_title(GTK_WINDOW(window->window), "");
   gtk_window_set_default_size(GTK_WINDOW(window->window), trout_window_width, trout_window_height);
   header = gtk_header_bar_new();
@@ -2676,7 +2791,8 @@ trout_window_create(GtkApplication *application, GFile *directory)
   menu_actions = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_box_append(GTK_BOX(menu_actions), trout_window_make_action_button("New Tab", "win.new-tab", window));
   gtk_box_append(GTK_BOX(menu_actions), trout_window_make_action_button("New Window", "win.new-window", window));
-  button = gtk_toggle_button_new_with_label("Hidden");
+  button = gtk_toggle_button_new();
+  trout_window_set_menu_item_label(button, "Hidden");
   window->hidden_button = button;
   g_signal_connect(button, "clicked", G_CALLBACK(trout_window_action_button), window->window);
   g_object_set_data(G_OBJECT(button), "trout_action", (gpointer)"win.toggle-hidden");
@@ -2684,23 +2800,17 @@ trout_window_create(GtkApplication *application, GFile *directory)
   gtk_box_append(GTK_BOX(menu_actions), button);
   separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
   gtk_box_append(GTK_BOX(menu_actions), separator);
-  button = gtk_check_button_new_with_label("Sort by name");
-  window->sort_name_button = button;
-  g_object_set_data(G_OBJECT(button), "trout_sort_order", GUINT_TO_POINTER(trout_sort_name));
-  g_signal_connect(button, "toggled", G_CALLBACK(trout_window_sort_toggled), window);
-  gtk_box_append(GTK_BOX(menu_actions), button);
-  button = gtk_check_button_new_with_label("Modification time (newest first)");
-  window->sort_modified_button = button;
-  gtk_check_button_set_group(GTK_CHECK_BUTTON(button), GTK_CHECK_BUTTON(window->sort_name_button));
-  g_object_set_data(G_OBJECT(button), "trout_sort_order", GUINT_TO_POINTER(trout_sort_modified));
-  g_signal_connect(button, "toggled", G_CALLBACK(trout_window_sort_toggled), window);
-  gtk_box_append(GTK_BOX(menu_actions), button);
-  button = gtk_check_button_new_with_label("Size (largest first)");
-  window->sort_size_button = button;
-  gtk_check_button_set_group(GTK_CHECK_BUTTON(button), GTK_CHECK_BUTTON(window->sort_name_button));
-  g_object_set_data(G_OBJECT(button), "trout_sort_order", GUINT_TO_POINTER(trout_sort_size));
-  g_signal_connect(button, "toggled", G_CALLBACK(trout_window_sort_toggled), window);
-  gtk_box_append(GTK_BOX(menu_actions), button);
+  sort_index = 0;
+  while (sort_index < trout_sort_order_count) {
+    button = gtk_check_button_new();
+    trout_window_set_menu_item_label(button, sort_labels[sort_index]);
+    if (sort_index > 0) gtk_check_button_set_group(GTK_CHECK_BUTTON(button), GTK_CHECK_BUTTON(window->sort_buttons[0]));
+    window->sort_buttons[sort_index] = button;
+    g_object_set_data(G_OBJECT(button), "trout_sort_order", GUINT_TO_POINTER(sort_index));
+    g_signal_connect(button, "toggled", G_CALLBACK(trout_window_sort_toggled), window);
+    gtk_box_append(GTK_BOX(menu_actions), button);
+    sort_index += 1;
+  }
   gtk_popover_set_child(GTK_POPOVER(popover), menu_actions);
   gtk_menu_button_set_popover(GTK_MENU_BUTTON(menu_button), popover);
   gtk_header_bar_pack_end(GTK_HEADER_BAR(header), menu_button);
