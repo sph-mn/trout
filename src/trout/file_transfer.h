@@ -28,7 +28,6 @@ struct trout_file_transfer_callbacks {
 trout_file_transfer_pair *trout_file_transfer_pair_new(GFile *source, GFile *destination);
 void trout_file_transfer_pair_destroy(gpointer user_data);
 gboolean trout_file_transfer_execute(GPtrArray *operations, trout_file_operation operation, GCancellable *cancellable, const trout_file_transfer_callbacks *callbacks, GError **error);
-gboolean trout_file_delete_tree(GFile *file, GCancellable *cancellable, GError **error);
-gboolean trout_file_copy_should_merge(GFileType source_type, GFileType destination_type, trout_file_operation operation);
+gboolean trout_file_transfer_should_merge(GFileType source_type, GFileType destination_type);
 
 #endif

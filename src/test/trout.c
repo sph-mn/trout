@@ -5,6 +5,45 @@
 #include <trout/sph/test.h>
 #undef status_t
 
+static gboolean
+trout_test_delete_tree(GFile *file, GError **error)
+{
+  GFileEnumerator *enumerator;
+  GFileInfo *info;
+  GFile *child;
+  const char *name;
+  info = g_file_query_info(file, "standard::type", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, 0, error);
+  if (info == 0) return FALSE;
+  if (g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
+    g_object_unref(info);
+    enumerator = g_file_enumerate_children(file, "standard::name", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, 0, error);
+    if (enumerator == 0) return FALSE;
+    while ((info = g_file_enumerator_next_file(enumerator, 0, error)) != 0) {
+      name = g_file_info_get_name(info);
+      child = g_file_get_child(file, name);
+      g_object_unref(info);
+      if (!trout_test_delete_tree(child, error)) {
+        g_object_unref(child);
+        g_object_unref(enumerator);
+        return FALSE;
+      }
+      g_object_unref(child);
+    }
+    if (*error != 0) {
+      g_object_unref(enumerator);
+      return FALSE;
+    }
+    if (!g_file_enumerator_close(enumerator, 0, error)) {
+      g_object_unref(enumerator);
+      return FALSE;
+    }
+    g_object_unref(enumerator);
+  } else {
+    g_object_unref(info);
+  }
+  return g_file_delete(file, 0, error);
+}
+
 trout_test_status_t
 trout_test_action_config_parse(void)
 {
@@ -123,14 +162,13 @@ exit:
 }
 
 trout_test_status_t
-trout_test_copy_merge_policy(void)
+trout_test_transfer_merge_policy(void)
 {
   trout_test_status_t status = {0};
   status.group = "";
-  test_helper_assert("copy merges existing directories", trout_file_copy_should_merge(G_FILE_TYPE_DIRECTORY, G_FILE_TYPE_DIRECTORY, trout_file_operation_copy));
-  test_helper_assert("copy does not merge a directory into a file", !trout_file_copy_should_merge(G_FILE_TYPE_DIRECTORY, G_FILE_TYPE_REGULAR, trout_file_operation_copy));
-  test_helper_assert("copy does not merge files", !trout_file_copy_should_merge(G_FILE_TYPE_REGULAR, G_FILE_TYPE_REGULAR, trout_file_operation_copy));
-  test_helper_assert("move does not merge directories", !trout_file_copy_should_merge(G_FILE_TYPE_DIRECTORY, G_FILE_TYPE_DIRECTORY, trout_file_operation_move));
+  test_helper_assert("directory transfers merge existing directories", trout_file_transfer_should_merge(G_FILE_TYPE_DIRECTORY, G_FILE_TYPE_DIRECTORY));
+  test_helper_assert("directory transfers do not merge into files", !trout_file_transfer_should_merge(G_FILE_TYPE_DIRECTORY, G_FILE_TYPE_REGULAR));
+  test_helper_assert("file transfers do not merge", !trout_file_transfer_should_merge(G_FILE_TYPE_REGULAR, G_FILE_TYPE_REGULAR));
 exit:
   return status;
 }
@@ -173,7 +211,7 @@ trout_test_file_delete_tree(void)
   test_helper_assert("nested file created", g_file_set_contents(nested_file, "content", -1, &error));
   g_clear_error(&error);
   remove_file = g_file_new_for_path(remove_directory);
-  test_helper_assert("nested tree deleted", trout_file_delete_tree(remove_file, 0, &error));
+  test_helper_assert("nested tree deleted", trout_test_delete_tree(remove_file, &error));
   test_helper_assert("nested tree no longer exists", !g_file_test(remove_directory, G_FILE_TEST_EXISTS));
   target_directory = g_build_filename(directory, "target", (char *)0);
   target_file = g_build_filename(target_directory, "file", (char *)0);
@@ -183,7 +221,7 @@ trout_test_file_delete_tree(void)
   g_clear_error(&error);
   link_file = g_file_new_for_path(link_path);
   test_helper_assert("symbolic link created", g_file_make_symbolic_link(link_file, target_directory, 0, &error));
-  test_helper_assert("symbolic link deleted", trout_file_delete_tree(link_file, 0, &error));
+  test_helper_assert("symbolic link deleted", trout_test_delete_tree(link_file, &error));
   test_helper_assert("symbolic link no longer exists", !g_file_test(link_path, G_FILE_TEST_IS_SYMLINK));
   test_helper_assert("link target remains", g_file_get_contents(target_file, &contents, 0, &error));
   test_helper_assert("link target contents remain", g_strcmp0(contents, "preserved") == 0);
@@ -191,7 +229,7 @@ exit:
   g_clear_error(&error);
   if (directory != 0) {
     root_file = g_file_new_for_path(directory);
-    trout_file_delete_tree(root_file, 0, &error);
+    trout_test_delete_tree(root_file, &error);
     g_clear_error(&error);
   }
   g_clear_object(&root_file);
@@ -367,7 +405,7 @@ exit:
   g_clear_error(&error);
   if (directory != 0) {
     root_file = g_file_new_for_path(directory);
-    trout_file_delete_tree(root_file, 0, &error);
+    trout_test_delete_tree(root_file, &error);
     g_clear_error(&error);
   }
   g_clear_object(&root_file);
@@ -477,10 +515,15 @@ trout_test_file_transfer_replace_and_cancel(void)
   g_ptr_array_set_size(operations, 0);
   trout_test_file_transfer_add(operations, source_file, destination_directory);
   response.collision_count = 0;
-  test_helper_assert("directory replacement succeeds", trout_test_file_transfer_run(operations, trout_file_operation_copy, cancellable, &response, &error));
+  test_helper_assert("directory replacement is refused", !trout_test_file_transfer_run(operations, trout_file_operation_copy, cancellable, &response, &error));
   test_helper_assert("directory collision was reported", response.collision_count == 1);
-  test_helper_assert("directory replaced by a file", g_file_test(destination_directory, G_FILE_TEST_IS_REGULAR));
-  test_helper_assert("old directory contents removed", !g_file_test(destination_nested_file, G_FILE_TEST_EXISTS));
+  test_helper_assert("directory replacement refusal is reported", g_error_matches(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED));
+  g_clear_error(&error);
+  test_helper_assert("destination directory remains", g_file_test(destination_directory, G_FILE_TEST_IS_DIR));
+  test_helper_assert("existing directory contents remain", g_file_get_contents(destination_nested_file, &contents, 0, &error));
+  test_helper_assert("existing directory contents are unchanged", g_strcmp0(contents, "old directory") == 0);
+  g_clear_pointer(&contents, g_free);
+  g_clear_error(&error);
   g_clear_pointer(&contents, g_free);
   g_ptr_array_set_size(operations, 0);
   trout_test_file_transfer_add(operations, source_directory, directory_destination);
@@ -509,7 +552,7 @@ exit:
   g_clear_error(&error);
   if (directory != 0) {
     root_file = g_file_new_for_path(directory);
-    trout_file_delete_tree(root_file, 0, &error);
+    trout_test_delete_tree(root_file, &error);
     g_clear_error(&error);
   }
   g_clear_object(&root_file);
@@ -543,9 +586,16 @@ trout_test_file_transfer_move_collisions(void)
   char *destination_file;
   char *source_directory;
   char *source_directory_file;
+  char *source_nested_directory;
+  char *source_nested_file;
+  char *source_nested_unique_file;
   char *destination_directory;
   char *destination_directory_file;
   char *destination_old_file;
+  char *destination_nested_directory;
+  char *destination_nested_file;
+  char *destination_nested_unique_file;
+  char *destination_nested_keep_file;
   char *contents;
   GFile *root_file;
   GPtrArray *operations;
@@ -557,9 +607,16 @@ trout_test_file_transfer_move_collisions(void)
   destination_file = 0;
   source_directory = 0;
   source_directory_file = 0;
+  source_nested_directory = 0;
+  source_nested_file = 0;
+  source_nested_unique_file = 0;
   destination_directory = 0;
   destination_directory_file = 0;
   destination_old_file = 0;
+  destination_nested_directory = 0;
+  destination_nested_file = 0;
+  destination_nested_unique_file = 0;
+  destination_nested_keep_file = 0;
   contents = 0;
   root_file = 0;
   operations = 0;
@@ -571,15 +628,27 @@ trout_test_file_transfer_move_collisions(void)
   destination_file = g_build_filename(directory, "destination.txt", (char *)0);
   source_directory = g_build_filename(directory, "source-directory", (char *)0);
   source_directory_file = g_build_filename(source_directory, "new.txt", (char *)0);
+  source_nested_directory = g_build_filename(source_directory, "nested", (char *)0);
+  source_nested_file = g_build_filename(source_nested_directory, "new.txt", (char *)0);
+  source_nested_unique_file = g_build_filename(source_nested_directory, "added.txt", (char *)0);
   destination_directory = g_build_filename(directory, "destination-directory", (char *)0);
   destination_directory_file = g_build_filename(destination_directory, "new.txt", (char *)0);
   destination_old_file = g_build_filename(destination_directory, "old.txt", (char *)0);
+  destination_nested_directory = g_build_filename(destination_directory, "nested", (char *)0);
+  destination_nested_file = g_build_filename(destination_nested_directory, "new.txt", (char *)0);
+  destination_nested_unique_file = g_build_filename(destination_nested_directory, "added.txt", (char *)0);
+  destination_nested_keep_file = g_build_filename(destination_nested_directory, "keep.txt", (char *)0);
   test_helper_assert("source file created", g_file_set_contents(source_file, "new file", -1, &error));
   test_helper_assert("destination file created", g_file_set_contents(destination_file, "old file", -1, &error));
-  test_helper_assert("source directory created", g_mkdir_with_parents(source_directory, 0700) == 0);
+  test_helper_assert("source directory created", g_mkdir_with_parents(source_nested_directory, 0700) == 0);
   test_helper_assert("source directory file created", g_file_set_contents(source_directory_file, "new directory", -1, &error));
-  test_helper_assert("destination directory created", g_mkdir_with_parents(destination_directory, 0700) == 0);
+  test_helper_assert("source nested file created", g_file_set_contents(source_nested_file, "new nested", -1, &error));
+  test_helper_assert("source nested unique file created", g_file_set_contents(source_nested_unique_file, "added nested", -1, &error));
+  test_helper_assert("destination directory created", g_mkdir_with_parents(destination_nested_directory, 0700) == 0);
   test_helper_assert("destination directory file created", g_file_set_contents(destination_old_file, "old directory", -1, &error));
+  test_helper_assert("destination conflicting file created", g_file_set_contents(destination_directory_file, "old conflicting file", -1, &error));
+  test_helper_assert("destination nested conflicting file created", g_file_set_contents(destination_nested_file, "old nested", -1, &error));
+  test_helper_assert("destination nested keep file created", g_file_set_contents(destination_nested_keep_file, "nested keep", -1, &error));
   g_clear_error(&error);
   operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
   cancellable = g_cancellable_new();
@@ -605,24 +674,45 @@ trout_test_file_transfer_move_collisions(void)
   response.choice = trout_file_collision_skip;
   response.collision_count = 0;
   test_helper_assert("directory move skip succeeds", trout_test_file_transfer_run(operations, trout_file_operation_move, cancellable, &response, &error));
-  test_helper_assert("directory move collision was reported", response.collision_count == 1);
-  test_helper_assert("directory move types were reported", response.source_type == G_FILE_TYPE_DIRECTORY && response.destination_type == G_FILE_TYPE_DIRECTORY);
+  test_helper_assert("directory move reports both conflicting files", response.collision_count == 2);
+  test_helper_assert("directory move reports file types", response.source_type == G_FILE_TYPE_REGULAR && response.destination_type == G_FILE_TYPE_REGULAR);
   test_helper_assert("skipped source directory remains", g_file_test(source_directory, G_FILE_TEST_IS_DIR));
   test_helper_assert("skipped destination directory remains", g_file_test(destination_directory, G_FILE_TEST_IS_DIR));
+  test_helper_assert("skipped source file remains", g_file_test(source_directory_file, G_FILE_TEST_IS_REGULAR));
+  test_helper_assert("skipped destination file remains", g_file_get_contents(destination_directory_file, &contents, 0, &error));
+  test_helper_assert("skipped destination contents remain", g_strcmp0(contents, "old conflicting file") == 0);
+  g_clear_pointer(&contents, g_free);
+  test_helper_assert("skipped nested source file remains", g_file_test(source_nested_file, G_FILE_TEST_IS_REGULAR));
+  test_helper_assert("nested unique source file was moved", !g_file_test(source_nested_unique_file, G_FILE_TEST_EXISTS));
+  test_helper_assert("nested destination conflict remains", g_file_get_contents(destination_nested_file, &contents, 0, &error));
+  test_helper_assert("nested destination contents remain", g_strcmp0(contents, "old nested") == 0);
+  g_clear_pointer(&contents, g_free);
+  test_helper_assert("nested unique file arrives at destination", g_file_get_contents(destination_nested_unique_file, &contents, 0, &error));
+  test_helper_assert("nested moved contents match", g_strcmp0(contents, "added nested") == 0);
+  g_clear_pointer(&contents, g_free);
   response.choice = trout_file_collision_replace;
   response.collision_count = 0;
-  test_helper_assert("directory move replacement succeeds", trout_test_file_transfer_run(operations, trout_file_operation_move, cancellable, &response, &error));
-  test_helper_assert("directory move replacement collision was reported", response.collision_count == 1);
-  test_helper_assert("directory move source removed", !g_file_test(source_directory, G_FILE_TEST_EXISTS));
-  test_helper_assert("directory move destination has new file", g_file_get_contents(destination_directory_file, &contents, 0, &error));
-  test_helper_assert("directory move contents match", g_strcmp0(contents, "new directory") == 0);
+  test_helper_assert("directory move replaces the conflicting file", trout_test_file_transfer_run(operations, trout_file_operation_move, cancellable, &response, &error));
+  test_helper_assert("directory move reports both file replacements", response.collision_count == 2);
+  test_helper_assert("directory move source is removed when empty", !g_file_test(source_directory, G_FILE_TEST_EXISTS));
+  test_helper_assert("directory move destination remains", g_file_test(destination_directory, G_FILE_TEST_IS_DIR));
+  test_helper_assert("directory move installs the source file", g_file_get_contents(destination_directory_file, &contents, 0, &error));
+  test_helper_assert("directory move uses source contents", g_strcmp0(contents, "new directory") == 0);
   g_clear_pointer(&contents, g_free);
-  test_helper_assert("directory move replaced old contents", !g_file_test(destination_old_file, G_FILE_TEST_EXISTS));
+  test_helper_assert("directory move installs the nested source file", g_file_get_contents(destination_nested_file, &contents, 0, &error));
+  test_helper_assert("directory move nested contents match", g_strcmp0(contents, "new nested") == 0);
+  g_clear_pointer(&contents, g_free);
+  test_helper_assert("directory move preserves unrelated destination files", g_file_get_contents(destination_old_file, &contents, 0, &error));
+  test_helper_assert("directory move preserves old contents", g_strcmp0(contents, "old directory") == 0);
+  g_clear_pointer(&contents, g_free);
+  test_helper_assert("directory move preserves nested destination files", g_file_get_contents(destination_nested_keep_file, &contents, 0, &error));
+  test_helper_assert("directory move preserves nested contents", g_strcmp0(contents, "nested keep") == 0);
+  g_clear_pointer(&contents, g_free);
 exit:
   g_clear_error(&error);
   if (directory != 0) {
     root_file = g_file_new_for_path(directory);
-    trout_file_delete_tree(root_file, 0, &error);
+    trout_test_delete_tree(root_file, &error);
     g_clear_error(&error);
   }
   g_clear_object(&root_file);
@@ -633,9 +723,16 @@ exit:
   g_free(destination_file);
   g_free(source_directory);
   g_free(source_directory_file);
+  g_free(source_nested_directory);
+  g_free(source_nested_file);
+  g_free(source_nested_unique_file);
   g_free(destination_directory);
   g_free(destination_directory_file);
   g_free(destination_old_file);
+  g_free(destination_nested_directory);
+  g_free(destination_nested_file);
+  g_free(destination_nested_unique_file);
+  g_free(destination_nested_keep_file);
   g_free(contents);
   return status;
 }
@@ -649,7 +746,7 @@ main(void)
   test_helper_test(trout_test_action_extension_matching);
   test_helper_test(trout_test_action_file_types);
   test_helper_test(trout_test_transfer_destination_guard);
-  test_helper_test(trout_test_copy_merge_policy);
+  test_helper_test(trout_test_transfer_merge_policy);
   test_helper_test(trout_test_file_delete_tree);
   test_helper_test(trout_test_file_transfer_merges_directories);
   test_helper_test(trout_test_file_transfer_replace_and_cancel);

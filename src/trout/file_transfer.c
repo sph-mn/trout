@@ -16,12 +16,12 @@ static void trout_file_transfer_progress_update(goffset current_bytes, goffset t
 static gboolean trout_file_transfer_is_collision(GError *error);
 static GFileInfo *trout_file_transfer_query_destination(GFile *destination, GCancellable *cancellable, gboolean *exists, GError **error);
 static gboolean trout_file_transfer_entry(GFile *source, GFile *destination, trout_file_operation operation, GCancellable *cancellable, const trout_file_transfer_callbacks *callbacks, GError **error);
-static gboolean trout_file_transfer_copy_directory(GFile *source, GFile *destination, GCancellable *cancellable, const trout_file_transfer_callbacks *callbacks, GError **error);
+static gboolean trout_file_transfer_directory(GFile *source, GFile *destination, trout_file_operation operation, GCancellable *cancellable, const trout_file_transfer_callbacks *callbacks, GError **error);
 
 gboolean
-trout_file_copy_should_merge(GFileType source_type, GFileType destination_type, trout_file_operation operation)
+trout_file_transfer_should_merge(GFileType source_type, GFileType destination_type)
 {
-  return operation == trout_file_operation_copy && source_type == G_FILE_TYPE_DIRECTORY && destination_type == G_FILE_TYPE_DIRECTORY;
+  return source_type == G_FILE_TYPE_DIRECTORY && destination_type == G_FILE_TYPE_DIRECTORY;
 }
 
 trout_file_transfer_pair *
@@ -133,9 +133,9 @@ trout_file_transfer_entry(GFile *source, GFile *destination, trout_file_operatio
     destination_info = trout_file_transfer_query_destination(destination, cancellable, &destination_exists, error);
     if (!destination_exists && *error != 0) return FALSE;
     destination_type = destination_info != 0 ? g_file_info_get_file_type(destination_info) : G_FILE_TYPE_UNKNOWN;
-    if (destination_exists && trout_file_copy_should_merge(source_type, destination_type, operation)) {
+    if (destination_exists && trout_file_transfer_should_merge(source_type, destination_type)) {
       g_object_unref(destination_info);
-      return trout_file_transfer_copy_directory(source, destination, cancellable, callbacks, error);
+      return trout_file_transfer_directory(source, destination, operation, cancellable, callbacks, error);
     }
     flags = G_FILE_COPY_NONE;
     if (destination_exists) {
@@ -149,10 +149,15 @@ trout_file_transfer_entry(GFile *source, GFile *destination, trout_file_operatio
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Transfer cancelled");
         return FALSE;
       }
+      if (destination_type == G_FILE_TYPE_DIRECTORY) {
+        g_object_unref(destination_info);
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Refusing to replace a directory because it may contain files");
+        return FALSE;
+      }
       if (source_type == G_FILE_TYPE_REGULAR && destination_type == G_FILE_TYPE_REGULAR) flags = G_FILE_COPY_OVERWRITE;
       else {
         g_object_unref(destination_info);
-        if (!trout_file_delete_tree(destination, cancellable, error)) return FALSE;
+        if (!g_file_delete(destination, cancellable, error)) return FALSE;
         destination_exists = FALSE;
         destination_info = 0;
       }
@@ -167,7 +172,7 @@ trout_file_transfer_entry(GFile *source, GFile *destination, trout_file_operatio
         }
         return FALSE;
       }
-      return trout_file_transfer_copy_directory(source, destination, cancellable, callbacks, error);
+      return trout_file_transfer_directory(source, destination, operation, cancellable, callbacks, error);
     }
     if (!trout_file_transfer_wait(callbacks, cancellable, error)) return FALSE;
     progress.callbacks = callbacks;
@@ -188,7 +193,7 @@ trout_file_transfer_entry(GFile *source, GFile *destination, trout_file_operatio
 }
 
 static gboolean
-trout_file_transfer_copy_directory(GFile *source, GFile *destination, GCancellable *cancellable, const trout_file_transfer_callbacks *callbacks, GError **error)
+trout_file_transfer_directory(GFile *source, GFile *destination, trout_file_operation operation, GCancellable *cancellable, const trout_file_transfer_callbacks *callbacks, GError **error)
 {
   GFileEnumerator *enumerator;
   GFileInfo *info;
@@ -202,7 +207,7 @@ trout_file_transfer_copy_directory(GFile *source, GFile *destination, GCancellab
     source_child = g_file_get_child(source, name);
     destination_child = g_file_get_child(destination, name);
     g_object_unref(info);
-    if (!trout_file_transfer_entry(source_child, destination_child, trout_file_operation_copy, cancellable, callbacks, error)) {
+    if (!trout_file_transfer_entry(source_child, destination_child, operation, cancellable, callbacks, error)) {
       g_object_unref(source_child);
       g_object_unref(destination_child);
       g_object_unref(enumerator);
@@ -220,112 +225,15 @@ trout_file_transfer_copy_directory(GFile *source, GFile *destination, GCancellab
     return FALSE;
   }
   g_object_unref(enumerator);
-  return TRUE;
-}
-
-gboolean
-trout_file_delete_tree(GFile *file, GCancellable *cancellable, GError **error)
-{
-  GFileInfo *info;
-  GFileInfo *child_info;
-  GFileEnumerator *enumerator;
-  GPtrArray *directories;
-  GPtrArray *files;
-  GFile *directory;
-  GFile *child;
-  const char *name;
-  GFileType child_type;
-  guint index;
-  info = g_file_query_info(file, "standard::type", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, error);
-  if (info == 0) {
-    if (g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
-      g_clear_error(error);
-      return TRUE;
-    }
-    return FALSE;
-  }
-  if (g_file_info_get_file_type(info) != G_FILE_TYPE_DIRECTORY) {
-    g_object_unref(info);
-    return g_file_delete(file, cancellable, error);
-  }
-  g_object_unref(info);
-  directories = g_ptr_array_new_with_free_func(g_object_unref);
-  files = g_ptr_array_new_with_free_func(g_object_unref);
-  g_ptr_array_add(directories, g_object_ref(file));
-  index = 0;
-  while (index < directories->len) {
-    directory = g_ptr_array_index(directories, index);
-    enumerator = g_file_enumerate_children(directory, "standard::name,standard::type", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, error);
-    if (enumerator == 0) {
-      g_ptr_array_unref(directories);
-      g_ptr_array_unref(files);
-      return FALSE;
-    }
-    while ((info = g_file_enumerator_next_file(enumerator, cancellable, error)) != 0) {
-      name = g_file_info_get_name(info);
-      child = g_file_get_child(directory, name);
-      child_type = g_file_info_get_file_type(info);
-      if (child_type == G_FILE_TYPE_UNKNOWN) {
-        child_info = g_file_query_info(child, "standard::type", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, error);
-        if (child_info == 0) {
-          g_object_unref(child);
-          g_object_unref(info);
-          g_object_unref(enumerator);
-          g_ptr_array_unref(directories);
-          g_ptr_array_unref(files);
-          return FALSE;
-        }
-        child_type = g_file_info_get_file_type(child_info);
-        g_object_unref(child_info);
+  if (operation == trout_file_operation_move) {
+    if (!trout_file_transfer_wait(callbacks, cancellable, error)) return FALSE;
+    if (!g_file_delete(source, cancellable, error)) {
+      if (g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_NOT_EMPTY)) {
+        g_clear_error(error);
+        return TRUE;
       }
-      if (child_type == G_FILE_TYPE_UNKNOWN) {
-        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Could not determine an existing item's type");
-        g_object_unref(child);
-        g_object_unref(info);
-        g_object_unref(enumerator);
-        g_ptr_array_unref(directories);
-        g_ptr_array_unref(files);
-        return FALSE;
-      }
-      if (child_type == G_FILE_TYPE_DIRECTORY) g_ptr_array_add(directories, child);
-      else g_ptr_array_add(files, child);
-      g_object_unref(info);
-    }
-    if (*error != 0) {
-      g_object_unref(enumerator);
-      g_ptr_array_unref(directories);
-      g_ptr_array_unref(files);
       return FALSE;
     }
-    if (!g_file_enumerator_close(enumerator, cancellable, error)) {
-      g_object_unref(enumerator);
-      g_ptr_array_unref(directories);
-      g_ptr_array_unref(files);
-      return FALSE;
-    }
-    g_object_unref(enumerator);
-    index += 1;
   }
-  index = 0;
-  while (index < files->len) {
-    if (!g_file_delete(g_ptr_array_index(files, index), cancellable, error)) {
-      g_ptr_array_unref(directories);
-      g_ptr_array_unref(files);
-      return FALSE;
-    }
-    index += 1;
-  }
-  index = directories->len;
-  while (index > 0) {
-    directory = g_ptr_array_index(directories, index - 1);
-    if (!g_file_delete(directory, cancellable, error)) {
-      g_ptr_array_unref(directories);
-      g_ptr_array_unref(files);
-      return FALSE;
-    }
-    index -= 1;
-  }
-  g_ptr_array_unref(directories);
-  g_ptr_array_unref(files);
   return TRUE;
 }

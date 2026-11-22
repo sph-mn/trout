@@ -272,6 +272,7 @@ void trout_tab_clipboard_read_start(GObject *source, GAsyncResult *result, gpoin
 void trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer user_data);
 void trout_tab_clipboard_read_destroy(trout_clipboard_read *read_data);
 GtkWidget *trout_tab_make_context_button(char *label, char *action_name, trout_tab *tab, GtkWidget *popover);
+void trout_tab_append_context_menu(trout_tab *tab, GtkWidget *popover, GtkWidget *menu_items, gboolean has_context_entry);
 void trout_tab_rename_accept(GtkWidget *widget, gpointer user_data);
 void trout_tab_rename_cancel(GtkButton *button, gpointer user_data);
 void trout_tab_rename_dialog_destroy(gpointer user_data);
@@ -485,23 +486,17 @@ trout_window_get_current_tab(trout_window *window)
   return g_object_get_data(G_OBJECT(page), "trout_tab");
 }
 
-gboolean
-trout_action_matches_file(trout_action *action, GFileInfo *file_info)
+static gboolean
+trout_action_matches_entry(trout_action *action, GFile *file, GFileType file_type, const char *name)
 {
-  GFile *file;
-  GFileType file_type;
-  char *name;
-  char *extension_start;
+  const char *extension_start;
   char **extension;
   gboolean matches;
-  file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
-  file_type = g_file_info_get_file_type(file_info);
   matches = g_file_is_native(file) &&
       ((file_type == G_FILE_TYPE_DIRECTORY && (action->file_types & trout_action_type_directories) != 0) ||
       (file_type != G_FILE_TYPE_DIRECTORY && (action->file_types & trout_action_type_files) != 0));
   if (matches && !action->any_extension) {
-    name = (char *)g_file_info_get_name(file_info);
-    extension_start = strrchr(name, '.');
+    extension_start = name != 0 ? strrchr(name, '.') : 0;
     if (extension_start == 0 || extension_start == name || extension_start[1] == '\0') {
       matches = FALSE;
     } else {
@@ -510,6 +505,25 @@ trout_action_matches_file(trout_action *action, GFileInfo *file_info)
       matches = *extension != 0;
     }
   }
+  return matches;
+}
+
+gboolean
+trout_action_matches_file(trout_action *action, GFileInfo *file_info)
+{
+  return trout_action_matches_entry(action,
+      G_FILE(g_file_info_get_attribute_object(file_info, "standard::file")),
+      g_file_info_get_file_type(file_info), g_file_info_get_name(file_info));
+}
+
+static gboolean
+trout_action_matches_directory(trout_action *action, GFile *directory)
+{
+  char *name;
+  gboolean matches;
+  name = g_file_get_basename(directory);
+  matches = trout_action_matches_entry(action, directory, G_FILE_TYPE_DIRECTORY, name);
+  g_free(name);
   return matches;
 }
 
@@ -609,6 +623,7 @@ trout_action_activate(GtkButton *button, gpointer user_data)
   GtkBitsetIter iterator;
   GFileInfo *file_info;
   GFile *file;
+  GFile *context_directory;
   char **arguments;
   char **command_argument;
   char **environment;
@@ -622,15 +637,22 @@ trout_action_activate(GtkButton *button, gpointer user_data)
   posix_spawn_file_actions_t spawn_actions;
   int spawn_status;
   gboolean path_error;
+  gboolean context_directory_action;
   window = user_data;
   tab = g_object_get_data(G_OBJECT(button), "trout_custom_tab");
   if (tab == 0) tab = trout_window_get_current_tab(window);
   action = g_object_get_data(G_OBJECT(button), "trout_custom_action");
   popover = g_object_get_data(G_OBJECT(button), "trout_custom_popover");
-  if (tab != 0 && trout_action_matches_selection(action, tab)) {
+  context_directory = g_object_get_data(G_OBJECT(button), "trout_context_directory");
+  context_directory_action = context_directory != 0;
+  if (tab != 0 && (context_directory_action ? trout_action_matches_directory(action, context_directory) : trout_action_matches_selection(action, tab))) {
     working_directory = g_file_get_path(tab->directory);
-    selected = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
-    selected_count = gtk_bitset_get_size(selected);
+    selected = 0;
+    selected_count = 1;
+    if (!context_directory_action) {
+      selected = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
+      selected_count = gtk_bitset_get_size(selected);
+    }
     command_count = g_strv_length(action->command);
     arguments = g_new0(char *, command_count + selected_count + 1);
     argument_index = 0;
@@ -640,12 +662,9 @@ trout_action_activate(GtkButton *button, gpointer user_data)
       argument_index += 1;
       command_argument += 1;
     }
-    gtk_bitset_iter_init_first(&iterator, selected, &position);
     path_error = FALSE;
-    while (!path_error) {
-      file_info = g_list_model_get_item(G_LIST_MODEL(tab->sorted_list), position);
-      file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
-      path = g_file_get_path(file);
+    if (context_directory_action) {
+      path = g_file_get_path(context_directory);
       if (path == 0) {
         gtk_label_set_text(GTK_LABEL(tab->status_label), "Custom actions require local files");
         path_error = TRUE;
@@ -653,8 +672,22 @@ trout_action_activate(GtkButton *button, gpointer user_data)
         arguments[argument_index] = path;
         argument_index += 1;
       }
-      g_object_unref(file_info);
-      if (!path_error && !gtk_bitset_iter_next(&iterator, &position)) break;
+    } else {
+      gtk_bitset_iter_init_first(&iterator, selected, &position);
+      while (!path_error) {
+        file_info = g_list_model_get_item(G_LIST_MODEL(tab->sorted_list), position);
+        file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
+        path = g_file_get_path(file);
+        if (path == 0) {
+          gtk_label_set_text(GTK_LABEL(tab->status_label), "Custom actions require local files");
+          path_error = TRUE;
+        } else {
+          arguments[argument_index] = path;
+          argument_index += 1;
+        }
+        g_object_unref(file_info);
+        if (!path_error && !gtk_bitset_iter_next(&iterator, &position)) break;
+      }
     }
     if (!path_error) {
       environment = g_get_environ();
@@ -673,7 +706,7 @@ trout_action_activate(GtkButton *button, gpointer user_data)
     }
     g_free(working_directory);
     g_strfreev(arguments);
-    gtk_bitset_unref(selected);
+    if (selected != 0) gtk_bitset_unref(selected);
   }
   if (popover != 0) gtk_popover_popdown(GTK_POPOVER(popover));
 }
@@ -1405,7 +1438,7 @@ trout_transfer_request_show_collision(gpointer user_data)
   source_path = g_file_get_parse_name(source);
   destination_path = g_file_get_parse_name(destination);
   destination_name = g_file_get_basename(destination);
-  if (destination_type == G_FILE_TYPE_DIRECTORY) message = g_strdup_printf("An item named “%s” already exists. Replacing this directory will delete its contents.", destination_name);
+  if (destination_type == G_FILE_TYPE_DIRECTORY) message = g_strdup_printf("An item named “%s” already exists. Trout will not replace directories because that could delete their contents. Choose Skip or Cancel.", destination_name);
   else message = g_strdup_printf("An item named “%s” already exists in the destination.", destination_name);
   dialog = gtk_window_new();
   request->collision.dialog = dialog;
@@ -1433,13 +1466,15 @@ trout_transfer_request_show_collision(gpointer user_data)
   buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
   gtk_widget_set_halign(buttons, GTK_ALIGN_END);
   skip_button = gtk_button_new_with_label("Skip");
-  replace_button = gtk_button_new_with_label("Replace");
   cancel_button = gtk_button_new_with_label(request->operation == trout_file_operation_copy ? "Cancel Copy" : "Cancel Move");
   g_signal_connect(skip_button, "clicked", G_CALLBACK(trout_transfer_request_resolve_collision), GINT_TO_POINTER(trout_file_collision_skip));
-  g_signal_connect(replace_button, "clicked", G_CALLBACK(trout_transfer_request_resolve_collision), GINT_TO_POINTER(trout_file_collision_replace));
   g_signal_connect(cancel_button, "clicked", G_CALLBACK(trout_transfer_request_resolve_collision), GINT_TO_POINTER(trout_file_collision_cancel));
   gtk_box_append(GTK_BOX(buttons), skip_button);
-  gtk_box_append(GTK_BOX(buttons), replace_button);
+  if (destination_type != G_FILE_TYPE_DIRECTORY) {
+    replace_button = gtk_button_new_with_label("Replace");
+    g_signal_connect(replace_button, "clicked", G_CALLBACK(trout_transfer_request_resolve_collision), GINT_TO_POINTER(trout_file_collision_replace));
+    gtk_box_append(GTK_BOX(buttons), replace_button);
+  }
   gtk_box_append(GTK_BOX(buttons), cancel_button);
   gtk_box_append(GTK_BOX(content), buttons);
   gtk_window_set_child(GTK_WINDOW(dialog), content);
@@ -2231,6 +2266,55 @@ trout_tab_make_context_button(char *label, char *action_name, trout_tab *tab, Gt
 }
 
 void
+trout_tab_append_context_menu(trout_tab *tab, GtkWidget *popover, GtkWidget *menu_items, gboolean has_context_entry)
+{
+  GtkBitset *selection;
+  GtkWidget *button;
+  GPtrArray *actions;
+  trout_action *action;
+  guint action_index;
+  gboolean has_selection;
+  gboolean has_custom_actions;
+  gboolean action_matches;
+  selection = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
+  has_selection = gtk_bitset_get_size(selection) > 0;
+  gtk_bitset_unref(selection);
+  button = trout_tab_make_context_button("Copy", "copy", tab, popover);
+  gtk_widget_set_sensitive(button, has_selection);
+  gtk_box_append(GTK_BOX(menu_items), button);
+  button = trout_tab_make_context_button("Cut", "cut", tab, popover);
+  gtk_widget_set_sensitive(button, has_selection);
+  gtk_box_append(GTK_BOX(menu_items), button);
+  if (tab->context_file_is_directory) gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Paste", "paste", tab, popover));
+  if (has_context_entry) {
+    gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Rename", "rename", tab, popover));
+    button = trout_tab_make_context_button("Delete", "delete", tab, popover);
+    gtk_widget_set_sensitive(button, FALSE);
+    gtk_box_append(GTK_BOX(menu_items), button);
+  }
+  actions = g_object_get_data(G_OBJECT(tab->window->application), "trout_actions");
+  action_index = 0;
+  has_custom_actions = FALSE;
+  while (action_index < actions->len) {
+    action = g_ptr_array_index(actions, action_index);
+    if ((action->appearance & trout_action_appearance_context) != 0) {
+      action_matches = has_context_entry ? trout_action_matches_selection(action, tab) : trout_action_matches_directory(action, tab->context_file);
+      if (action_matches) {
+        if (!has_custom_actions) {
+          gtk_box_append(GTK_BOX(menu_items), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+          has_custom_actions = TRUE;
+        }
+        button = trout_action_make_button(action, tab->window, popover);
+        g_object_set_data(G_OBJECT(button), "trout_custom_tab", tab);
+        if (!has_context_entry) g_object_set_data(G_OBJECT(button), "trout_context_directory", tab->context_file);
+        gtk_box_append(GTK_BOX(menu_items), button);
+      }
+    }
+    action_index += 1;
+  }
+}
+
+void
 trout_tab_context_action(GtkButton *button, gpointer user_data)
 {
   trout_tab *tab;
@@ -2267,12 +2351,6 @@ trout_tab_on_entry_context_pressed(GtkGestureClick *gesture, gint press_count, d
   GFile *file;
   GtkWidget *popover;
   GtkWidget *menu_items;
-  GtkWidget *action_button;
-  GtkWidget *delete_button;
-  GPtrArray *actions;
-  trout_action *action;
-  guint action_index;
-  gboolean has_custom_actions;
   GFileType file_type;
   GdkRectangle point;
   tab = user_data;
@@ -2299,29 +2377,7 @@ trout_tab_on_entry_context_pressed(GtkGestureClick *gesture, gint press_count, d
   popover = gtk_popover_new();
   tab->context_popover = popover;
   menu_items = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Copy", "copy", tab, popover));
-  gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Cut", "cut", tab, popover));
-  gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Paste", "paste", tab, popover));
-  gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Rename", "rename", tab, popover));
-  delete_button = trout_tab_make_context_button("Delete", "delete", tab, popover);
-  gtk_widget_set_sensitive(delete_button, FALSE);
-  gtk_box_append(GTK_BOX(menu_items), delete_button);
-  actions = g_object_get_data(G_OBJECT(tab->window->application), "trout_actions");
-  action_index = 0;
-  has_custom_actions = FALSE;
-  while (action_index < actions->len) {
-    action = g_ptr_array_index(actions, action_index);
-    if ((action->appearance & trout_action_appearance_context) != 0 && trout_action_matches_selection(action, tab)) {
-      if (!has_custom_actions) {
-        gtk_box_append(GTK_BOX(menu_items), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-        has_custom_actions = TRUE;
-      }
-      action_button = trout_action_make_button(action, tab->window, popover);
-      g_object_set_data(G_OBJECT(action_button), "trout_custom_tab", tab);
-      gtk_box_append(GTK_BOX(menu_items), action_button);
-    }
-    action_index += 1;
-  }
+  trout_tab_append_context_menu(tab, popover, menu_items, TRUE);
   gtk_popover_set_child(GTK_POPOVER(popover), menu_items);
   g_signal_connect(popover, "closed", G_CALLBACK(trout_tab_context_closed), tab);
   point.x = x;
@@ -2499,7 +2555,6 @@ trout_tab_on_background_context_pressed(GtkGestureClick *gesture, gint press_cou
   tab = user_data;
   target = gtk_widget_pick(tab->grid, x, y, GTK_PICK_DEFAULT);
   if (target != tab->grid) return;
-  gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(tab->selection));
   if (tab->context_file != 0) g_object_unref(tab->context_file);
   tab->context_file = g_object_ref(tab->directory);
   tab->context_file_is_directory = TRUE;
@@ -2511,7 +2566,7 @@ trout_tab_on_background_context_pressed(GtkGestureClick *gesture, gint press_cou
   popover = gtk_popover_new();
   tab->context_popover = popover;
   menu_items = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-  gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Paste", "paste", tab, popover));
+  trout_tab_append_context_menu(tab, popover, menu_items, FALSE);
   gtk_popover_set_child(GTK_POPOVER(popover), menu_items);
   g_signal_connect(popover, "closed", G_CALLBACK(trout_tab_context_closed), tab);
   point.x = x;

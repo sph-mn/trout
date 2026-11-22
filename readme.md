@@ -9,7 +9,7 @@ Features
 * Fast and immediate thumbnail generation
 * Custom right-click actions
 * Custom action buttons
-* Directory copies merge into existing directories with the same name
+* Directory copies and moves merge into existing directories with the same name
 * Copy and move collisions offer Skip, Replace, and Cancel
 * Queued copy and move tasks with progress, pause, resume, and cancel
 
@@ -17,7 +17,7 @@ The first implementation provides asynchronous monitored directory listings, a c
 
 ## File operations
 
-Copying a directory into an existing directory with the same name merges their contents recursively. Existing files and paths that cannot be merged prompt for Skip, Replace, or Cancel. Replace overwrites conflicting files; when the source and destination have different types, it removes the destination before installing the source.
+Copying or moving a directory into an existing directory with the same name merges their contents recursively. Moves move files into the existing tree. Colliding files prompt for Skip, Replace, or Cancel. Replacing a directory is refused to protect its contents.
 
 Copy and move requests run in a queue. The active request shows progress and can be paused, resumed, or canceled.
 
