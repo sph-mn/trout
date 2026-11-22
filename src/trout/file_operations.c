@@ -429,6 +429,210 @@ trout_tab_rename_cancel(GtkButton *button, gpointer user_data)
 }
 
 void
+trout_tab_create_dialog_destroy(gpointer user_data)
+{
+  trout_create_dialog *create_data;
+  create_data = user_data;
+  g_object_unref(create_data->directory);
+  g_object_unref(create_data->root);
+  g_object_unref(create_data->status_label);
+  g_free(create_data);
+}
+
+gboolean
+trout_tab_create_name_is_valid(char *name)
+{
+  return name[0] != '\0' && strchr(name, '/') == 0 && strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+}
+
+void
+trout_tab_create_dialog_changed(GtkEditable *editable, gpointer user_data)
+{
+  trout_create_dialog *create_data;
+  char *name;
+  create_data = user_data;
+  name = (char *)gtk_editable_get_text(editable);
+  gtk_widget_set_sensitive(create_data->create_button, !create_data->in_progress && trout_tab_create_name_is_valid(name));
+}
+
+void
+trout_tab_create_request_destroy(gpointer user_data)
+{
+  trout_create_request *request;
+  request = user_data;
+  g_object_unref(request->target);
+  g_free(request);
+}
+
+void
+trout_tab_create_dialog_accept(GtkButton *button, gpointer user_data)
+{
+  trout_create_dialog *create_data;
+  trout_create_request *request;
+  GTask *task;
+  GFile *target;
+  char *name;
+  create_data = user_data;
+  name = (char *)gtk_editable_get_text(GTK_EDITABLE(create_data->entry));
+  if (create_data->in_progress || !trout_tab_create_name_is_valid(name)) return;
+  target = g_file_get_child(create_data->directory, name);
+  request = g_new(trout_create_request, 1);
+  request->target = target;
+  request->create_directory = create_data->create_directory;
+  create_data->in_progress = TRUE;
+  gtk_widget_set_sensitive(create_data->entry, FALSE);
+  gtk_widget_set_sensitive(create_data->create_button, FALSE);
+  gtk_widget_set_sensitive(create_data->cancel_button, FALSE);
+  gtk_label_set_text(GTK_LABEL(create_data->message), "Creating…");
+  task = g_task_new(G_OBJECT(gtk_widget_get_root(GTK_WIDGET(button))), 0, trout_tab_create_complete, 0);
+  g_task_set_task_data(task, request, trout_tab_create_request_destroy);
+  g_task_run_in_thread(task, trout_tab_create_worker);
+  g_object_unref(task);
+}
+
+void
+trout_tab_create_dialog_cancel(GtkButton *button, gpointer user_data)
+{
+  gtk_window_destroy(GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))));
+  (void)user_data;
+}
+
+void
+trout_tab_create_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+{
+  trout_create_request *request;
+  GFileOutputStream *stream;
+  GError *error;
+  gboolean succeeded;
+  request = task_data;
+  error = 0;
+  if (request->create_directory) {
+    succeeded = g_file_make_directory(request->target, cancellable, &error);
+  } else {
+    stream = g_file_create(request->target, G_FILE_CREATE_NONE, cancellable, &error);
+    succeeded = stream != 0;
+    if (stream != 0) {
+      succeeded = g_output_stream_close(G_OUTPUT_STREAM(stream), cancellable, &error);
+      g_object_unref(stream);
+    }
+  }
+  if (succeeded) g_task_return_boolean(task, TRUE);
+  else g_task_return_error(task, error);
+  (void)source_object;
+}
+
+void
+trout_tab_create_complete(GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+  trout_create_dialog *create_data;
+  GError *error;
+  gboolean succeeded;
+  char *name;
+  create_data = g_object_get_data(source_object, "trout_create_data");
+  error = 0;
+  succeeded = g_task_propagate_boolean(G_TASK(result), &error);
+  if (succeeded) {
+    if (gtk_widget_get_root(create_data->root) != 0) trout_tab_reload_directory(create_data->tab);
+    if (gtk_widget_get_visible(GTK_WIDGET(source_object))) gtk_window_destroy(GTK_WINDOW(source_object));
+  } else {
+    create_data->in_progress = FALSE;
+    gtk_widget_set_sensitive(create_data->entry, TRUE);
+    gtk_widget_set_sensitive(create_data->cancel_button, TRUE);
+    name = (char *)gtk_editable_get_text(GTK_EDITABLE(create_data->entry));
+    gtk_widget_set_sensitive(create_data->create_button, trout_tab_create_name_is_valid(name));
+    gtk_label_set_text(GTK_LABEL(create_data->message), error->message);
+    trout_tab_show_error(create_data->status_label, error);
+    g_error_free(error);
+  }
+  (void)user_data;
+}
+
+void
+trout_tab_create_named_entry(trout_tab *tab, gboolean create_directory)
+{
+  trout_create_dialog *create_data;
+  GtkRoot *parent;
+  GtkWidget *dialog;
+  GtkWidget *content;
+  GtkWidget *entry;
+  GtkWidget *message;
+  GtkWidget *buttons;
+  GtkWidget *cancel_button;
+  GtkWidget *create_button;
+  dialog = gtk_window_new();
+  gtk_window_set_title(GTK_WINDOW(dialog), create_directory ? "New Directory" : "New File");
+  gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+  gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+  parent = gtk_widget_get_root(tab->root);
+  if (parent != 0 && GTK_IS_WINDOW(parent)) {
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(parent));
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
+  }
+  gtk_window_set_default_size(GTK_WINDOW(dialog), 360, -1);
+  create_data = g_new0(trout_create_dialog, 1);
+  create_data->tab = tab;
+  create_data->directory = g_object_ref(tab->directory);
+  create_data->root = g_object_ref(tab->root);
+  create_data->status_label = g_object_ref(tab->status_label);
+  create_data->create_directory = create_directory;
+  g_object_set_data_full(G_OBJECT(dialog), "trout_create_data", create_data, trout_tab_create_dialog_destroy);
+  content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(content, 12);
+  gtk_widget_set_margin_end(content, 12);
+  gtk_widget_set_margin_top(content, 12);
+  gtk_widget_set_margin_bottom(content, 12);
+  entry = gtk_entry_new();
+  create_data->entry = entry;
+  gtk_box_append(GTK_BOX(content), entry);
+  message = gtk_label_new("");
+  create_data->message = message;
+  gtk_label_set_xalign(GTK_LABEL(message), 0.0f);
+  gtk_label_set_wrap(GTK_LABEL(message), TRUE);
+  gtk_box_append(GTK_BOX(content), message);
+  buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(buttons, GTK_ALIGN_END);
+  cancel_button = gtk_button_new_with_label("Cancel");
+  create_data->cancel_button = cancel_button;
+  create_button = gtk_button_new_with_label("Create");
+  create_data->create_button = create_button;
+  gtk_widget_set_sensitive(create_button, FALSE);
+  g_signal_connect(cancel_button, "clicked", G_CALLBACK(trout_tab_create_dialog_cancel), create_data);
+  g_signal_connect(create_button, "clicked", G_CALLBACK(trout_tab_create_dialog_accept), create_data);
+  g_signal_connect(entry, "changed", G_CALLBACK(trout_tab_create_dialog_changed), create_data);
+  gtk_box_append(GTK_BOX(buttons), cancel_button);
+  gtk_box_append(GTK_BOX(buttons), create_button);
+  gtk_box_append(GTK_BOX(content), buttons);
+  gtk_window_set_child(GTK_WINDOW(dialog), content);
+  gtk_window_set_default_widget(GTK_WINDOW(dialog), create_button);
+  gtk_window_present(GTK_WINDOW(dialog));
+  gtk_widget_grab_focus(entry);
+}
+
+void
+trout_window_action_new_directory(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+{
+  trout_window *window;
+  trout_tab *tab;
+  window = user_data;
+  tab = trout_window_get_current_tab(window);
+  if (tab != 0) trout_tab_create_named_entry(tab, TRUE);
+  (void)action;
+  (void)parameter;
+}
+
+void
+trout_window_action_new_file(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+{
+  trout_window *window;
+  trout_tab *tab;
+  window = user_data;
+  tab = trout_window_get_current_tab(window);
+  if (tab != 0) trout_tab_create_named_entry(tab, FALSE);
+  (void)action;
+  (void)parameter;
+}
+
+void
 trout_tab_rename_context_file(trout_tab *tab)
 {
   GtkWidget *dialog;
@@ -619,8 +823,7 @@ trout_tab_properties_done(GObject *source_object, GAsyncResult *result, gpointer
   GtkWidget *label;
   trout_properties_result *properties;
   GError *error;
-  double value;
-  char number[64];
+  char *size_text;
   char *text;
   dialog = GTK_WIDGET(source_object);
   error = 0;
@@ -628,16 +831,10 @@ trout_tab_properties_done(GObject *source_object, GAsyncResult *result, gpointer
   if (error != 0) g_error_free(error);
   if (properties != 0 && gtk_widget_get_visible(dialog)) {
     label = g_object_get_data(G_OBJECT(dialog), "trout_properties_size_label");
-    if (properties->size < UINT64_C(10000000)) {
-      value = (double)properties->size / 1000.0;
-      g_ascii_formatd(number, sizeof(number), "%.2f", value);
-      text = g_strdup_printf("%s%s kB", properties->incomplete ? ">= " : "", number);
-    } else {
-      value = (double)properties->size / 1000000000.0;
-      g_ascii_formatd(number, sizeof(number), "%.2f", value);
-      text = g_strdup_printf("%s%s GB", properties->incomplete ? ">= " : "", number);
-    }
+    size_text = trout_format_size(properties->size, properties->incomplete);
+    text = g_strdup_printf("Size: %s", size_text);
     gtk_label_set_text(GTK_LABEL(label), text);
+    g_free(size_text);
     g_free(text);
   }
   g_free(properties);
@@ -700,7 +897,7 @@ trout_tab_show_properties(trout_tab *tab)
   g_signal_connect(dialog, "close-request", G_CALLBACK(trout_tab_properties_close_request), 0);
   cancellable = g_cancellable_new();
   g_object_set_data_full(G_OBJECT(dialog), "trout_properties_cancellable", cancellable, g_object_unref);
-  task = g_task_new(dialog, cancellable, trout_tab_properties_done, 0);
+  task = g_task_new(G_OBJECT(dialog), cancellable, trout_tab_properties_done, 0);
   g_task_set_task_data(task, g_object_ref(tab->context_file), g_object_unref);
   g_task_run_in_thread(task, trout_tab_properties_worker);
   g_object_unref(task);

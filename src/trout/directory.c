@@ -587,6 +587,7 @@ trout_tab_set_directory(trout_tab *tab, GFile *directory)
   tab->directory = g_object_ref(directory);
   if (directory_changed) {
     trout_tab_update_directory_monitor(tab);
+    trout_tab_update_free_space(tab);
     if (tab->directory_selection != 0) {
       g_hash_table_unref(tab->directory_selection);
       tab->directory_selection = 0;
@@ -599,6 +600,14 @@ trout_tab_set_directory(trout_tab *tab, GFile *directory)
   gtk_widget_grab_focus(tab->grid);
   trout_tab_update_status(tab);
   if (trout_window_get_current_tab(tab->window) == tab) trout_window_update_custom_actions(tab->window);
+}
+
+void
+trout_tab_reload_directory(trout_tab *tab)
+{
+  tab->directory_dirty = TRUE;
+  gtk_directory_list_set_file(tab->directory_list, 0);
+  gtk_directory_list_set_file(tab->directory_list, tab->directory);
 }
 
 void
@@ -833,6 +842,8 @@ trout_tab_factory_setup(GtkSignalListItemFactory *factory, GtkListItem *list_ite
   drag_source = gtk_drag_source_new();
   gtk_drag_source_set_actions(drag_source, GDK_ACTION_COPY | GDK_ACTION_MOVE);
   g_signal_connect(drag_source, "drag-begin", G_CALLBACK(trout_tab_on_drag_begin), tab);
+  g_signal_connect(drag_source, "drag-end", G_CALLBACK(trout_tab_on_drag_end), tab);
+  g_signal_connect(drag_source, "drag-cancel", G_CALLBACK(trout_tab_on_drag_cancel), tab);
   g_signal_connect(drag_source, "prepare", G_CALLBACK(trout_tab_on_drag_prepare), tab);
   gtk_widget_add_controller(row, GTK_EVENT_CONTROLLER(drag_source));
   primary_click = gtk_gesture_click_new();
@@ -840,6 +851,8 @@ trout_tab_factory_setup(GtkSignalListItemFactory *factory, GtkListItem *list_ite
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(primary_click), GDK_BUTTON_PRIMARY);
   g_signal_connect(primary_click, "pressed", G_CALLBACK(trout_tab_on_entry_pressed), tab);
   g_signal_connect(primary_click, "released", G_CALLBACK(trout_tab_on_entry_released), tab);
+  g_signal_connect(primary_click, "cancel", G_CALLBACK(trout_tab_on_entry_cancelled), tab);
+  g_signal_connect(primary_click, "stopped", G_CALLBACK(trout_tab_on_entry_stopped), tab);
   gtk_widget_add_controller(row, GTK_EVENT_CONTROLLER(primary_click));
   gtk_list_item_set_child(list_item, row);
 }

@@ -304,6 +304,21 @@ trout_transfer_request_update_label(trout_transfer_request *request)
 }
 
 void
+trout_transfer_queue_show_paused(trout_window *window)
+{
+  guint queued_count;
+  char *text;
+  queued_count = g_queue_get_length(&window->transfer_queue);
+  text = g_strdup_printf("Paused after failure · %u queued", queued_count);
+  gtk_label_set_text(GTK_LABEL(window->transfer_label), text);
+  g_free(text);
+  gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(window->transfer_progress), 0.0);
+  gtk_widget_set_sensitive(window->transfer_pause_button, TRUE);
+  gtk_button_set_label(GTK_BUTTON(window->transfer_pause_button), "Resume");
+  gtk_widget_set_sensitive(window->transfer_cancel_button, FALSE);
+}
+
+void
 trout_transfer_request_finish(trout_transfer_request *request)
 {
   trout_window *window;
@@ -314,13 +329,15 @@ trout_transfer_request_finish(trout_transfer_request *request)
   window->active_transfer = 0;
   trout_transfer_request_destroy(request);
   if (g_queue_is_empty(&window->transfer_queue)) {
+    window->transfer_queue_paused = FALSE;
     gtk_window_destroy(GTK_WINDOW(window->transfer_dialog));
     window->transfer_dialog = 0;
     window->transfer_label = 0;
     window->transfer_progress = 0;
     window->transfer_pause_button = 0;
     window->transfer_cancel_button = 0;
-  } else trout_transfer_request_start_next(window);
+  } else if (window->transfer_queue_paused) trout_transfer_queue_show_paused(window);
+  else trout_transfer_request_start_next(window);
   g_object_unref(window_widget);
 }
 
@@ -329,6 +346,7 @@ trout_transfer_request_start_next(trout_window *window)
 {
   trout_transfer_request *request;
   GTask *task;
+  if (window->transfer_queue_paused || g_queue_is_empty(&window->transfer_queue)) return;
   request = g_queue_pop_head(&window->transfer_queue);
   window->active_transfer = request;
   gtk_widget_set_sensitive(window->transfer_cancel_button, TRUE);
@@ -399,7 +417,8 @@ trout_transfer_request_enqueue(trout_window *window, GtkWidget *status_label, GP
     gtk_window_set_child(GTK_WINDOW(window->transfer_dialog), content);
   }
   gtk_window_present(GTK_WINDOW(window->transfer_dialog));
-  if (window->active_transfer == 0) trout_transfer_request_start_next(window);
+  if (window->active_transfer == 0 && window->transfer_queue_paused) trout_transfer_queue_show_paused(window);
+  else if (window->active_transfer == 0) trout_transfer_request_start_next(window);
   else trout_transfer_request_update_label(window->active_transfer);
 }
 
@@ -439,6 +458,9 @@ trout_transfer_pause(GtkButton *button, gpointer user_data)
     g_mutex_unlock(&request->pause_mutex);
     gtk_button_set_label(button, request->paused ? "Resume" : "Pause");
     trout_transfer_request_update_label(request);
+  } else if (window->transfer_queue_paused) {
+    window->transfer_queue_paused = FALSE;
+    trout_transfer_request_start_next(window);
   }
 }
 
@@ -515,6 +537,7 @@ trout_transfer_request_complete(GObject *source, GAsyncResult *result, gpointer 
   error = 0;
   succeeded = g_task_propagate_boolean(G_TASK(result), &error);
   if (!succeeded && error != 0 && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+    if (!g_queue_is_empty(&request->window->transfer_queue)) request->window->transfer_queue_paused = TRUE;
     if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_RECURSE)) gtk_label_set_text(GTK_LABEL(request->status_label), "Cannot copy a directory into itself or one of its subdirectories");
     else trout_tab_show_error(request->status_label, error);
   }
