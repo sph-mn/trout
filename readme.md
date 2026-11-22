@@ -36,7 +36,7 @@ The command and its arguments are split on spaces and run directly without a she
 ## Build
 Run `./exe/compile` to create `exe/compiled/trout`.
 
-Trout was inspired by Thunar to improve on various issues Thunar never fixed:
+Trout was inspired by Thunar to improve on various issues:
 * Slow Thumbnail creation only when the file comes into view, which is too late
 * Replacing directories, requiring a local copy for all files, instead of merging and just doing a local move
 * Excessive slow-downs on large directories

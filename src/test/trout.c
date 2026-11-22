@@ -261,7 +261,7 @@ trout_test_file_transfer_wait(gpointer user_data)
 }
 
 trout_file_collision_choice
-trout_test_file_transfer_collision(GFile *source, GFile *destination, GFileType source_type, GFileType destination_type, gpointer user_data)
+trout_test_file_transfer_collision(GFile *source, GFile *destination, GFile *source_root, GFile *destination_root, GFileType source_type, GFileType destination_type, goffset source_size, goffset destination_size, gpointer user_data)
 {
   trout_test_file_transfer_response *response;
   response = user_data;
@@ -270,6 +270,10 @@ trout_test_file_transfer_collision(GFile *source, GFile *destination, GFileType 
   response->collision_count += 1;
   (void)source;
   (void)destination;
+  (void)source_root;
+  (void)destination_root;
+  (void)source_size;
+  (void)destination_size;
   return response->choice;
 }
 

@@ -21,7 +21,7 @@ typedef struct trout_file_transfer_callbacks trout_file_transfer_callbacks;
 struct trout_file_transfer_callbacks {
   gpointer user_data;
   gboolean (*wait)(gpointer user_data);
-  trout_file_collision_choice (*collision)(GFile *source, GFile *destination, GFileType source_type, GFileType destination_type, gpointer user_data);
+  trout_file_collision_choice (*collision)(GFile *source, GFile *destination, GFile *source_root, GFile *destination_root, GFileType source_type, GFileType destination_type, goffset source_size, goffset destination_size, gpointer user_data);
   void (*progress)(GFile *source, goffset current_bytes, goffset total_bytes, gpointer user_data);
 };
 
