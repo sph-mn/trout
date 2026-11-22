@@ -135,6 +135,10 @@ struct trout_tab {
   gboolean drag_started;
   gboolean rubberband_disabled;
   gboolean directory_dirty;
+  gboolean directory_range_pending;
+  guint directory_range_position;
+  guint directory_range_removed;
+  guint directory_range_added;
   gboolean directory_recovery_pending;
   GString *typeahead_prefix;
   gboolean completion_has_suffix;

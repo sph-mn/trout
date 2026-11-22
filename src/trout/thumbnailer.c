@@ -66,7 +66,8 @@ status_t trout_thumbnailer_new_temp_path(trout_thumbnailer *thumbnailer, char **
 status_t trout_thumbnailer_save_pixbuf(trout_thumbnailer *thumbnailer, GdkPixbuf *pixbuf, char *cache_path, char *uri, GFileInfo *file_info);
 GdkPixbuf *trout_thumbnailer_scale_pixbuf(GdkPixbuf *pixbuf);
 gboolean trout_thumbnailer_cache_valid(char *cache_path, guint64 modified, guint32 modified_usec);
-guint trout_thumbnailer_file_kind(trout_thumbnailer *thumbnailer, char *path);
+guint trout_thumbnailer_file_kind(trout_thumbnailer *thumbnailer, char *name);
+status_t trout_thumbnailer_schedule_file_kind(trout_thumbnailer *thumbnailer, GFile *file, guint kind);
 gboolean trout_thumbnailer_has_pictures(trout_thumbnailer *thumbnailer, char *uri);
 void trout_thumbnailer_publish_texture(trout_thumbnailer *thumbnailer, char *uri, GdkTexture *texture);
 gboolean trout_thumbnailer_deliver_updates(gpointer user_data);
@@ -146,19 +147,43 @@ trout_thumbnailer_destroy(gpointer data)
 }
 
 status_t
-trout_thumbnailer_schedule_file(trout_thumbnailer *thumbnailer, GFile *file)
+trout_thumbnailer_schedule_file_info(trout_thumbnailer *thumbnailer, GFileInfo *file_info)
+{
+  GFile *file;
+  char *name;
+  guint kind;
+  name = (char *)g_file_info_get_name(file_info);
+  kind = trout_thumbnailer_file_kind(thumbnailer, name);
+  if (kind == 0) return trout_status_success;
+  file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
+  return trout_thumbnailer_schedule_file_kind(thumbnailer, file, kind);
+}
+
+status_t
+trout_thumbnailer_schedule_file_named(trout_thumbnailer *thumbnailer, GFile *directory, char *name)
+{
+  GFile *file;
+  guint kind;
+  status_t status;
+  kind = trout_thumbnailer_file_kind(thumbnailer, name);
+  if (kind == 0) return trout_status_success;
+  file = g_file_get_child(directory, name);
+  status = trout_thumbnailer_schedule_file_kind(thumbnailer, file, kind);
+  g_object_unref(file);
+  return status;
+}
+
+status_t
+trout_thumbnailer_schedule_file_kind(trout_thumbnailer *thumbnailer, GFile *file, guint kind)
 {
   trout_thumbnail_task *task;
   char *path;
   char *uri;
-  guint kind;
   gboolean stopping;
   int error;
   path = g_file_get_path(file);
   if (path == 0) return trout_status_success;
-  kind = trout_thumbnailer_file_kind(thumbnailer, path);
   g_free(path);
-  if (kind == 0) return trout_status_success;
   uri = g_file_get_uri(file);
   g_mutex_lock(&thumbnailer->mutex);
   if (thumbnailer->stopping || g_hash_table_contains(thumbnailer->pending_files, uri)) {
@@ -221,10 +246,13 @@ trout_thumbnailer_schedule_directory(trout_thumbnailer *thumbnailer, GFile *dire
 }
 
 status_t
-trout_thumbnailer_bind_picture(trout_thumbnailer *thumbnailer, GFile *file, GtkPicture *picture)
+trout_thumbnailer_bind_picture(trout_thumbnailer *thumbnailer, GFile *file, char *name, GtkPicture *picture)
 {
   GPtrArray *pictures;
   char *uri;
+  guint kind;
+  kind = trout_thumbnailer_file_kind(thumbnailer, name);
+  if (kind == 0) return trout_status_success;
   uri = g_file_get_uri(file);
   g_mutex_lock(&thumbnailer->mutex);
   pictures = g_hash_table_lookup(thumbnailer->pictures, uri);
@@ -235,7 +263,7 @@ trout_thumbnailer_bind_picture(trout_thumbnailer *thumbnailer, GFile *file, GtkP
   g_ptr_array_add(pictures, picture);
   g_mutex_unlock(&thumbnailer->mutex);
   g_object_set_data_full(G_OBJECT(picture), "trout_thumbnail_uri", g_strdup(uri), g_free);
-  if (trout_thumbnailer_schedule_file(thumbnailer, file) != trout_status_success) {
+  if (trout_thumbnailer_schedule_file_kind(thumbnailer, file, kind) != trout_status_success) {
     trout_thumbnailer_unbind_picture(thumbnailer, picture);
     g_free(uri);
     return trout_status_error;
@@ -297,7 +325,6 @@ trout_thumbnailer_scan_directory(trout_thumbnail_task *task)
 {
   GFileEnumerator *enumerator;
   GFileInfo *file_info;
-  GFile *file;
   GError *error;
   char *name;
   gboolean stopping;
@@ -322,11 +349,9 @@ trout_thumbnailer_scan_directory(trout_thumbnail_task *task)
     if (g_file_info_get_file_type(file_info) == G_FILE_TYPE_REGULAR ||
         g_file_info_get_file_type(file_info) == G_FILE_TYPE_SYMBOLIC_LINK) {
       name = (char *)g_file_info_get_name(file_info);
-      file = g_file_get_child(task->file, name);
-      if (trout_thumbnailer_schedule_file(task->thumbnailer, file) != trout_status_success) {
+      if (trout_thumbnailer_schedule_file_named(task->thumbnailer, task->file, name) != trout_status_success) {
         g_debug("Could not queue thumbnail for %s", name);
       }
-      g_object_unref(file);
     }
     g_object_unref(file_info);
   }
@@ -718,11 +743,11 @@ trout_thumbnailer_cache_valid(char *cache_path, guint64 modified, guint32 modifi
 }
 
 guint
-trout_thumbnailer_file_kind(trout_thumbnailer *thumbnailer, char *path)
+trout_thumbnailer_file_kind(trout_thumbnailer *thumbnailer, char *name)
 {
   char *suffix;
   char **extension;
-  suffix = strrchr(path, '.');
+  suffix = strrchr(name, '.');
   if (suffix == 0 || suffix[1] == '\0') return 0;
   suffix += 1;
   if (g_ascii_strcasecmp(suffix, "jpg") == 0 || g_ascii_strcasecmp(suffix, "jpeg") == 0 ||
