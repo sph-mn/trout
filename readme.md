@@ -5,24 +5,14 @@ Trout is a GTK4 file manager for local directories.
 ![](other/trout.png)
 
 Features
-* Fast with large directories (10k+ files)
-* Fast and immediate thumbnail generation
-* Custom right-click actions
-* Custom action buttons
-* Directory copies and moves merge into existing directories with the same name
-* Copy and move collisions offer Skip, Replace, and Cancel
-* Queued copy and move tasks with progress, pause, resume, and cancel
-
-The first implementation provides asynchronous monitored directory listings, a compact horizontal browser, breadcrumb navigation with an editable location field, Ctrl+wheel zoom, tabs, new windows, hidden file toggling, and an item selection status line.
-
-## File operations
-
-Copying or moving a directory into an existing directory with the same name merges their contents recursively. Moves move files into the existing tree. Colliding files prompt for Skip, Replace, or Cancel. Replacing a directory is refused to protect its contents.
-
-Copy and move requests run in a queue. The active request shows progress and can be paused, resumed, or canceled.
+* Usable with large directories (10k+ files)
+* Immediate thumbnail pre-generation for the current directory and subdirectories
+* Custom action buttons and right-click actions
+* Automatic directory merging
+* Queued file operations with pause and device parallelization
+* Tabs
 
 ## Custom actions
-
 Custom actions are loaded at startup from `$XDG_CONFIG_HOME/trout/actions` (normally `~/.config/trout/actions`). The file uses LF line endings. Each non-empty line has this format, with single spaces between fields:
 
 ```text
@@ -37,7 +27,7 @@ The command and its arguments are split on spaces and run directly without a she
 Run `./exe/compile` to create `exe/compiled/trout`.
 
 Trout was inspired by Thunar to improve on various issues:
-* Slow Thumbnail creation only when the file comes into view, which is too late
-* Replacing directories, requiring a local copy for all files, instead of merging and just doing a local move
-* Excessive slow-downs on large directories
-* Not continuing the file copy queue after one item was manually paused
+* Thumbnail creation only as files scroll into view, which is too late
+* Directory replace requiring a copy of files instead of merging with renames
+* Excessive slow-downs when selecting many files in large directories
+* Not automatically continuing the queue after an item was manually paused
