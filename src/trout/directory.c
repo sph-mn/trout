@@ -89,11 +89,16 @@ void
 trout_tab_set_sort_order(trout_tab *tab, guint sort_order)
 {
   GtkSorter *sorter;
+  trout_preferences *preferences;
   if (tab->sort_order != sort_order) {
     tab->sort_order = sort_order;
     sorter = trout_create_file_sorter(sort_order);
     gtk_sort_list_model_set_sorter(tab->sorted_list, sorter);
     g_object_unref(sorter);
+    preferences = g_object_get_data(G_OBJECT(tab->window->application), "trout_preferences");
+    preferences->sort_order = sort_order;
+    preferences->dirty = TRUE;
+    trout_preferences_schedule_save(preferences);
   }
 }
 
@@ -199,14 +204,38 @@ trout_tab_selection_changed(GtkSelectionModel *model, guint position, guint coun
   (void)count;
 }
 
-gboolean trout_tab_publish_directory_range(trout_tab *tab, GListModel *model, guint position, guint removed, guint added);
+gboolean
+trout_file_equal(gconstpointer left, gconstpointer right)
+{
+  return g_file_equal((GFile *)left, (GFile *)right);
+}
+
+static void
+trout_tab_save_directory_scroll(trout_tab *tab)
+{
+  tab->directory_scroll_horizontal = gtk_adjustment_get_value(
+      gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(tab->scrolled_window)));
+  tab->directory_scroll_vertical = gtk_adjustment_get_value(
+      gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(tab->scrolled_window)));
+  tab->directory_scroll_pending = TRUE;
+}
+
+static void
+trout_tab_restore_directory_scroll(trout_tab *tab)
+{
+  if (!tab->directory_scroll_pending || gtk_sort_list_model_get_pending(tab->sorted_list) != 0) return;
+  tab->directory_scroll_pending = FALSE;
+  gtk_adjustment_set_value(gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(tab->scrolled_window)),
+      tab->directory_scroll_horizontal);
+  gtk_adjustment_set_value(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(tab->scrolled_window)),
+      tab->directory_scroll_vertical);
+}
 
 void
 trout_tab_on_directory_items_changed(GListModel *model, guint position, guint removed, guint added, gpointer user_data)
 {
   trout_tab *tab;
   GFileInfo *file_info;
-  GFile *file;
   char *name;
   char *collation_key;
   GFileType file_type;
@@ -216,15 +245,10 @@ trout_tab_on_directory_items_changed(GListModel *model, guint position, guint re
   while (index < position + added) {
     file_info = g_list_model_get_item(model, index);
     name = (char *)g_file_info_get_name(file_info);
-    collation_key = g_utf8_collate_key(g_file_info_get_display_name(file_info), -1);
+    collation_key = g_utf8_collate_key_for_filename(g_file_info_get_display_name(file_info), -1);
     g_object_set_data_full(G_OBJECT(file_info), "trout_collation_key", collation_key, g_free);
     file_type = g_file_info_get_file_type(file_info);
-    if (file_type == G_FILE_TYPE_DIRECTORY) {
-      file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
-      if (trout_thumbnailer_schedule_directory(tab->window->thumbnailer, file) != trout_status_success) {
-        g_debug("Could not queue thumbnail directory %s", name);
-      }
-    } else if (file_type == G_FILE_TYPE_REGULAR || file_type == G_FILE_TYPE_SYMBOLIC_LINK) {
+    if (file_type == G_FILE_TYPE_REGULAR || file_type == G_FILE_TYPE_SYMBOLIC_LINK) {
       if (trout_thumbnailer_schedule_file_info(tab->window->thumbnailer, file_info) != trout_status_success) {
         g_debug("Could not queue thumbnail file %s", name);
       }
@@ -232,19 +256,159 @@ trout_tab_on_directory_items_changed(GListModel *model, guint position, guint re
     g_object_unref(file_info);
     index += 1;
   }
-  if (removed == 0 && added == 0) return;
-  if (tab->directory_dirty || gtk_directory_list_is_loading(tab->directory_list) || tab->directory_range_pending) {
+  if (removed != 0 || added != 0) {
     tab->directory_dirty = TRUE;
-    tab->directory_range_pending = FALSE;
-  } else {
-    tab->directory_range_pending = TRUE;
-    tab->directory_range_position = position;
-    tab->directory_range_removed = removed;
-    tab->directory_range_added = added;
+    trout_tab_schedule_directory_refresh(tab);
   }
 }
 
+void
+trout_tab_schedule_directory_refresh(trout_tab *tab)
+{
+  if (tab->directory_refresh_source_id == 0) {
+    tab->directory_refresh_source_id = g_timeout_add(trout_directory_refresh_interval_milliseconds,
+        trout_tab_refresh_directory_timeout, tab);
+  }
+}
+
+void
+trout_tab_discard_directory_snapshot(trout_tab *tab)
+{
+  if (tab->directory_refresh_source_id != 0) {
+    g_source_remove(tab->directory_refresh_source_id);
+    tab->directory_refresh_source_id = 0;
+  }
+  tab->directory_dirty = FALSE;
+  tab->directory_initialized = FALSE;
+  tab->directory_has_thumbnailable_file = FALSE;
+  tab->directory_scroll_pending = FALSE;
+  g_list_store_remove_all(tab->display_list);
+}
+
+static gboolean
+trout_file_info_display_equal(GFileInfo *left, GFileInfo *right)
+{
+  GFile *left_file;
+  GFile *right_file;
+  GIcon *left_icon;
+  GIcon *right_icon;
+  left_file = G_FILE(g_file_info_get_attribute_object(left, "standard::file"));
+  right_file = G_FILE(g_file_info_get_attribute_object(right, "standard::file"));
+  left_icon = g_file_info_get_icon(left);
+  right_icon = g_file_info_get_icon(right);
+  return g_file_equal(left_file, right_file) &&
+      g_strcmp0(g_file_info_get_name(left), g_file_info_get_name(right)) == 0 &&
+      g_strcmp0(g_file_info_get_display_name(left), g_file_info_get_display_name(right)) == 0 &&
+      g_file_info_get_file_type(left) == g_file_info_get_file_type(right) &&
+      (left_icon == right_icon || (left_icon != 0 && right_icon != 0 && g_icon_equal(left_icon, right_icon))) &&
+      g_strcmp0(g_file_info_get_attribute_string(left, "standard::fast-content-type"),
+          g_file_info_get_attribute_string(right, "standard::fast-content-type")) == 0 &&
+      g_file_info_get_is_hidden(left) == g_file_info_get_is_hidden(right) &&
+      g_file_info_get_size(left) == g_file_info_get_size(right) &&
+      g_file_info_get_attribute_uint64(left, G_FILE_ATTRIBUTE_TIME_MODIFIED) ==
+          g_file_info_get_attribute_uint64(right, G_FILE_ATTRIBUTE_TIME_MODIFIED) &&
+      g_file_info_get_attribute_uint32(left, G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC) ==
+          g_file_info_get_attribute_uint32(right, G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC);
+}
+
 static void
+trout_tab_refresh_directory_snapshot(trout_tab *tab)
+{
+  GFileInfo *file_info;
+  GPtrArray *snapshot;
+  gpointer *added_items;
+  guint item_count;
+  guint old_item_count;
+  guint prefix;
+  guint suffix;
+  guint added_count;
+  guint added_index;
+  guint scan_index;
+  guint scan_end;
+  gboolean items_match;
+  gboolean has_thumbnailable_file;
+  gboolean scan_all_subdirectories;
+  tab->directory_dirty = FALSE;
+  tab->directory_initialized = TRUE;
+  snapshot = g_ptr_array_new_with_free_func(g_object_unref);
+  item_count = g_list_model_get_n_items(G_LIST_MODEL(tab->directory_list));
+  added_index = 0;
+  while (added_index < item_count) {
+    g_ptr_array_add(snapshot, g_list_model_get_item(G_LIST_MODEL(tab->directory_list), added_index));
+    added_index += 1;
+  }
+  has_thumbnailable_file = FALSE;
+  added_index = 0;
+  while (added_index < snapshot->len && !has_thumbnailable_file) {
+    file_info = g_ptr_array_index(snapshot, added_index);
+    if ((g_file_info_get_file_type(file_info) == G_FILE_TYPE_REGULAR ||
+            g_file_info_get_file_type(file_info) == G_FILE_TYPE_SYMBOLIC_LINK) &&
+        trout_thumbnailer_file_name_is_thumbnailable(tab->window->thumbnailer, (char *)g_file_info_get_name(file_info))) {
+      has_thumbnailable_file = TRUE;
+    }
+    added_index += 1;
+  }
+  old_item_count = g_list_model_get_n_items(G_LIST_MODEL(tab->display_list));
+  prefix = 0;
+  while (prefix < old_item_count && prefix < snapshot->len) {
+    file_info = g_list_model_get_item(G_LIST_MODEL(tab->display_list), prefix);
+    items_match = trout_file_info_display_equal(file_info, g_ptr_array_index(snapshot, prefix));
+    g_object_unref(file_info);
+    if (!items_match) break;
+    prefix += 1;
+  }
+  suffix = 0;
+  while (suffix < old_item_count - prefix && suffix < snapshot->len - prefix) {
+    file_info = g_list_model_get_item(G_LIST_MODEL(tab->display_list), old_item_count - suffix - 1);
+    items_match = trout_file_info_display_equal(file_info, g_ptr_array_index(snapshot, snapshot->len - suffix - 1));
+    g_object_unref(file_info);
+    if (!items_match) break;
+    suffix += 1;
+  }
+  scan_all_subdirectories = has_thumbnailable_file && !tab->directory_has_thumbnailable_file;
+  if (has_thumbnailable_file) {
+    scan_index = scan_all_subdirectories ? 0 : prefix;
+    scan_end = scan_all_subdirectories ? snapshot->len : snapshot->len - suffix;
+    while (scan_index < scan_end) {
+      file_info = g_ptr_array_index(snapshot, scan_index);
+      if (g_file_info_get_file_type(file_info) == G_FILE_TYPE_DIRECTORY) {
+        if (trout_thumbnailer_schedule_directory(tab->window->thumbnailer,
+                G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"))) != trout_status_success) {
+          g_debug("Could not queue thumbnail directory %s", g_file_info_get_name(file_info));
+        }
+      }
+      scan_index += 1;
+    }
+  }
+  tab->directory_has_thumbnailable_file = has_thumbnailable_file;
+  if (prefix == old_item_count && prefix == snapshot->len) {
+    g_ptr_array_unref(snapshot);
+    trout_tab_restore_directory_scroll(tab);
+    trout_tab_restore_directory_selection(tab);
+    return;
+  }
+  trout_tab_save_directory_selection(tab);
+  added_count = snapshot->len - prefix - suffix;
+  added_items = added_count != 0 ? snapshot->pdata + prefix : 0;
+  trout_tab_save_directory_scroll(tab);
+  g_list_store_splice(tab->display_list, prefix, old_item_count - prefix - suffix, added_items, added_count);
+  g_ptr_array_unref(snapshot);
+  trout_tab_restore_directory_scroll(tab);
+  trout_tab_restore_directory_selection(tab);
+}
+
+gboolean
+trout_tab_refresh_directory_timeout(gpointer user_data)
+{
+  trout_tab *tab;
+  tab = user_data;
+  if (gtk_directory_list_is_loading(tab->directory_list)) return G_SOURCE_CONTINUE;
+  tab->directory_refresh_source_id = 0;
+  if (tab->directory_dirty) trout_tab_refresh_directory_snapshot(tab);
+  return G_SOURCE_REMOVE;
+}
+
+void
 trout_tab_restore_directory_selection(trout_tab *tab)
 {
   GtkBitset *selected_positions;
@@ -278,12 +442,6 @@ trout_tab_restore_directory_selection(trout_tab *tab)
   g_hash_table_unref(selected_files);
 }
 
-static gboolean
-trout_file_equal(gconstpointer left, gconstpointer right)
-{
-  return g_file_equal((GFile *)left, (GFile *)right);
-}
-
 void
 trout_tab_save_directory_selection(trout_tab *tab)
 {
@@ -309,143 +467,32 @@ trout_tab_save_directory_selection(trout_tab *tab)
   tab->directory_selection = selected_files;
 }
 
-gboolean
-trout_tab_publish_directory_range(trout_tab *tab, GListModel *model, guint position, guint removed, guint added)
-{
-  GtkBitset *selected;
-  gpointer *added_items;
-  gboolean has_selection;
-  guint index;
-  if (tab->directory_dirty || gtk_directory_list_is_loading(tab->directory_list)) return FALSE;
-  selected = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
-  has_selection = gtk_bitset_get_size(selected) != 0;
-  gtk_bitset_unref(selected);
-  if (has_selection || tab->directory_selection != 0) trout_tab_save_directory_selection(tab);
-  added_items = added != 0 ? g_new(gpointer, added) : 0;
-  index = 0;
-  while (index < added) {
-    added_items[index] = g_list_model_get_item(model, position + index);
-    index += 1;
-  }
-  g_list_store_splice(tab->display_list, position, removed, added_items, added);
-  index = 0;
-  while (index < added) {
-    g_object_unref(added_items[index]);
-    index += 1;
-  }
-  g_free(added_items);
-  if (tab->directory_selection != 0) trout_tab_restore_directory_selection(tab);
-  return TRUE;
-}
-
-static gboolean
-trout_file_info_display_equal(GFileInfo *left, GFileInfo *right)
-{
-  GFile *left_file;
-  GFile *right_file;
-  GIcon *left_icon;
-  GIcon *right_icon;
-  left_file = G_FILE(g_file_info_get_attribute_object(left, "standard::file"));
-  right_file = G_FILE(g_file_info_get_attribute_object(right, "standard::file"));
-  left_icon = g_file_info_get_icon(left);
-  right_icon = g_file_info_get_icon(right);
-  return g_file_equal(left_file, right_file) &&
-      g_strcmp0(g_file_info_get_name(left), g_file_info_get_name(right)) == 0 &&
-      g_strcmp0(g_file_info_get_display_name(left), g_file_info_get_display_name(right)) == 0 &&
-      g_file_info_get_file_type(left) == g_file_info_get_file_type(right) &&
-      (left_icon == right_icon || (left_icon != 0 && right_icon != 0 && g_icon_equal(left_icon, right_icon))) &&
-      g_strcmp0(g_file_info_get_attribute_string(left, "standard::fast-content-type"),
-          g_file_info_get_attribute_string(right, "standard::fast-content-type")) == 0 &&
-      g_file_info_get_is_hidden(left) == g_file_info_get_is_hidden(right) &&
-      g_file_info_get_size(left) == g_file_info_get_size(right) &&
-      g_file_info_get_attribute_uint64(left, G_FILE_ATTRIBUTE_TIME_MODIFIED) ==
-          g_file_info_get_attribute_uint64(right, G_FILE_ATTRIBUTE_TIME_MODIFIED) &&
-      g_file_info_get_attribute_uint32(left, G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC) ==
-          g_file_info_get_attribute_uint32(right, G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC);
-}
-
-static void
-trout_tab_publish_directory(trout_tab *tab)
-{
-  GFileInfo *old_file_info;
-  GPtrArray *snapshot;
-  gpointer *added_items;
-  guint position;
-  guint item_count;
-  guint old_item_count;
-  guint common_prefix;
-  guint common_suffix;
-  guint added_count;
-  gboolean items_match;
-  snapshot = g_ptr_array_new_with_free_func(g_object_unref);
-  item_count = g_list_model_get_n_items(G_LIST_MODEL(tab->directory_list));
-  position = 0;
-  while (position < item_count) {
-    g_ptr_array_add(snapshot, g_list_model_get_item(G_LIST_MODEL(tab->directory_list), position));
-    position += 1;
-  }
-  old_item_count = g_list_model_get_n_items(G_LIST_MODEL(tab->display_list));
-  common_prefix = 0;
-  while (common_prefix < old_item_count && common_prefix < snapshot->len) {
-    old_file_info = g_list_model_get_item(G_LIST_MODEL(tab->display_list), common_prefix);
-    items_match = trout_file_info_display_equal(old_file_info, g_ptr_array_index(snapshot, common_prefix));
-    g_object_unref(old_file_info);
-    if (!items_match) break;
-    common_prefix += 1;
-  }
-  common_suffix = 0;
-  while (common_suffix < old_item_count - common_prefix && common_suffix < snapshot->len - common_prefix) {
-    old_file_info = g_list_model_get_item(G_LIST_MODEL(tab->display_list), old_item_count - common_suffix - 1);
-    items_match = trout_file_info_display_equal(old_file_info, g_ptr_array_index(snapshot, snapshot->len - common_suffix - 1));
-    g_object_unref(old_file_info);
-    if (!items_match) break;
-    common_suffix += 1;
-  }
-  tab->directory_dirty = FALSE;
-  tab->directory_range_pending = FALSE;
-  if (common_prefix == old_item_count && common_prefix == snapshot->len) {
-    g_ptr_array_unref(snapshot);
-    trout_tab_restore_directory_selection(tab);
-    return;
-  }
-  trout_tab_save_directory_selection(tab);
-  added_count = snapshot->len - common_prefix - common_suffix;
-  added_items = added_count != 0 ? snapshot->pdata + common_prefix : 0;
-  g_list_store_splice(tab->display_list, common_prefix, old_item_count - common_prefix - common_suffix, added_items, added_count);
-  g_ptr_array_unref(snapshot);
-  trout_tab_restore_directory_selection(tab);
-}
-
-static gboolean
-trout_tab_refresh_directory(gpointer user_data)
-{
-  trout_tab *tab;
-  tab = user_data;
-  if (!gtk_directory_list_is_loading(tab->directory_list)) {
-    if (tab->directory_dirty) trout_tab_publish_directory(tab);
-    else if (tab->directory_range_pending) {
-      tab->directory_range_pending = FALSE;
-      if (!trout_tab_publish_directory_range(tab, G_LIST_MODEL(tab->directory_list), tab->directory_range_position,
-          tab->directory_range_removed, tab->directory_range_added)) tab->directory_dirty = TRUE;
-    }
-  }
-  return G_SOURCE_CONTINUE;
-}
-
 static void
 trout_tab_on_directory_loading_changed(GtkDirectoryList *directory_list, GParamSpec *property, gpointer user_data)
 {
   trout_tab *tab;
   tab = user_data;
   trout_tab_update_status(tab);
-  if (!gtk_directory_list_is_loading(directory_list) && tab->directory_dirty) trout_tab_publish_directory(tab);
+  if (!tab->directory_transition && !gtk_directory_list_is_loading(directory_list)) {
+    if (!tab->directory_initialized) {
+      if (tab->directory_refresh_source_id != 0) {
+        g_source_remove(tab->directory_refresh_source_id);
+        tab->directory_refresh_source_id = 0;
+      }
+      trout_tab_refresh_directory_snapshot(tab);
+    } else if (tab->directory_dirty) trout_tab_schedule_directory_refresh(tab);
+  }
+  (void)directory_list;
   (void)property;
 }
 
 static void
 trout_tab_on_sort_pending_changed(GtkSortListModel *model, GParamSpec *property, gpointer user_data)
 {
-  trout_tab_restore_directory_selection(user_data);
+  trout_tab *tab;
+  tab = user_data;
+  trout_tab_restore_directory_scroll(tab);
+  trout_tab_restore_directory_selection(tab);
   (void)model;
   (void)property;
 }
@@ -635,17 +682,20 @@ trout_tab_set_directory(trout_tab *tab, GFile *directory)
   if (tab->directory != 0) g_object_unref(tab->directory);
   tab->directory = g_object_ref(directory);
   if (directory_changed) {
+    trout_tab_discard_directory_snapshot(tab);
+    gtk_adjustment_set_value(gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(tab->scrolled_window)), 0.0);
     trout_tab_update_directory_monitor(tab);
     trout_tab_update_free_space(tab);
-    tab->directory_range_pending = FALSE;
     if (tab->directory_selection != 0) {
       g_hash_table_unref(tab->directory_selection);
       tab->directory_selection = 0;
     }
-    g_list_store_remove_all(tab->display_list);
-    tab->directory_dirty = TRUE;
-  }
-  gtk_directory_list_set_file(tab->directory_list, directory);
+    gtk_selection_model_unselect_all(GTK_SELECTION_MODEL(tab->selection));
+    tab->directory_transition = TRUE;
+    gtk_directory_list_set_file(tab->directory_list, 0);
+    gtk_directory_list_set_file(tab->directory_list, directory);
+    tab->directory_transition = FALSE;
+  } else gtk_directory_list_set_file(tab->directory_list, directory);
   trout_tab_update_location(tab);
   gtk_widget_grab_focus(tab->grid);
   trout_tab_update_status(tab);
@@ -655,10 +705,11 @@ trout_tab_set_directory(trout_tab *tab, GFile *directory)
 void
 trout_tab_reload_directory(trout_tab *tab)
 {
-  tab->directory_dirty = TRUE;
-  tab->directory_range_pending = FALSE;
+  trout_tab_discard_directory_snapshot(tab);
+  tab->directory_transition = TRUE;
   gtk_directory_list_set_file(tab->directory_list, 0);
   gtk_directory_list_set_file(tab->directory_list, tab->directory);
+  tab->directory_transition = FALSE;
 }
 
 void
@@ -704,9 +755,24 @@ gboolean
 trout_tab_on_location_key(GtkEventControllerKey *controller, guint keyval, guint keycode, GdkModifierType state, gpointer user_data)
 {
   trout_tab *tab;
+  GtkEditable *editable;
+  gint position;
   (void)controller;
   (void)keycode;
   tab = user_data;
+  if (keyval == GDK_KEY_BackSpace && tab->completion_has_suffix) {
+    editable = GTK_EDITABLE(tab->location_entry);
+    position = tab->completion_suffix_start;
+    trout_tab_cancel_location_completion(tab);
+    tab->completion_suppressed = TRUE;
+    gtk_editable_delete_text(editable, position, gtk_entry_get_text_length(GTK_ENTRY(tab->location_entry)));
+    if (position > 0) gtk_editable_delete_text(editable, position - 1, position);
+    gtk_editable_set_position(editable, position > 0 ? position - 1 : 0);
+    tab->completion_suppressed = FALSE;
+    tab->completion_has_suffix = FALSE;
+    tab->completion_suffix_start = 0;
+    return TRUE;
+  }
   if (keyval == GDK_KEY_Tab && (state & GDK_CONTROL_MASK) == 0 && gtk_editable_get_position(GTK_EDITABLE(tab->location_entry)) == gtk_entry_get_text_length(GTK_ENTRY(tab->location_entry))) {
     if (!tab->completion_has_suffix) {
       tab->completion_has_suffix = FALSE;
@@ -730,6 +796,8 @@ trout_tab_on_location_focus_leave(GtkEventControllerFocus *controller, gpointer 
   trout_tab *tab;
   tab = user_data;
   trout_tab_cancel_location_completion(tab);
+  tab->completion_has_suffix = FALSE;
+  tab->completion_suffix_start = 0;
   gtk_stack_set_visible_child_name(GTK_STACK(tab->location_stack), "buttons");
   (void)controller;
 }
@@ -740,6 +808,8 @@ trout_tab_edit_location(trout_tab *tab)
   char *path;
   trout_tab_clear_typeahead(tab);
   trout_tab_cancel_location_completion(tab);
+  tab->completion_has_suffix = FALSE;
+  tab->completion_suffix_start = 0;
   path = g_file_get_path(tab->directory);
   if (path == 0) path = g_file_get_uri(tab->directory);
   tab->completion_suppressed = TRUE;
@@ -791,11 +861,13 @@ trout_tab_complete_location(trout_tab *tab, gboolean highlight)
   editable = GTK_EDITABLE(tab->location_entry);
   text = g_strdup(gtk_editable_get_text(editable));
   if (text[0] == '\0' || text[strlen(text) - 1] == '/') {
+    tab->completion_suffix_start = 0;
     g_free(text);
     return;
   }
   cursor_position = gtk_editable_get_position(editable);
   if (cursor_position != g_utf8_strlen(text, -1) || gtk_editable_get_selection_bounds(editable, &selection_start, &selection_end)) {
+    tab->completion_suffix_start = 0;
     g_free(text);
     return;
   }
@@ -805,11 +877,12 @@ trout_tab_complete_location(trout_tab *tab, gboolean highlight)
   suffix = g_filename_completer_get_completion_suffix(tab->filename_completer, completion_text);
   if (suffix != 0 && suffix[0] != '\0') {
     text_length = g_utf8_strlen(text, -1);
+    tab->completion_suffix_start = text_length;
     gtk_editable_insert_text(editable, suffix, -1, &cursor_position);
     if (highlight) gtk_editable_select_region(editable, text_length, -1);
     else gtk_editable_set_position(editable, cursor_position);
     tab->completion_has_suffix = highlight;
-  }
+  } else tab->completion_suffix_start = 0;
   tab->completion_suppressed = FALSE;
   g_free(suffix);
   g_free(completion_text);
@@ -823,6 +896,7 @@ trout_tab_on_location_changed(GtkEditable *editable, gpointer user_data)
   tab = user_data;
   if (tab->completion_suppressed) return;
   tab->completion_has_suffix = FALSE;
+  tab->completion_suffix_start = 0;
   trout_tab_schedule_location_completion(tab, TRUE);
   (void)editable;
 }
@@ -832,7 +906,10 @@ trout_tab_on_location_position_changed(GObject *object, GParamSpec *property, gp
 {
   trout_tab *tab;
   tab = user_data;
-  if (!tab->completion_suppressed) tab->completion_has_suffix = FALSE;
+  if (!tab->completion_suppressed) {
+    tab->completion_has_suffix = FALSE;
+    tab->completion_suffix_start = 0;
+  }
   (void)object;
   (void)property;
 }
@@ -922,6 +999,7 @@ trout_tab_factory_bind(GtkSignalListItemFactory *factory, GtkListItem *list_item
   GFileType file_type;
   (void)factory;
   tab = user_data;
+  g_hash_table_add(tab->directory_bound_rows, gtk_list_item_get_child(list_item));
   file_info = gtk_list_item_get_item(list_item);
   image = g_object_get_data(G_OBJECT(list_item), "trout_image");
   picture = g_object_get_data(G_OBJECT(list_item), "trout_picture");
@@ -952,6 +1030,7 @@ trout_tab_factory_unbind(GtkSignalListItemFactory *factory, GtkListItem *list_it
   GtkPicture *picture;
   (void)factory;
   tab = user_data;
+  g_hash_table_remove(tab->directory_bound_rows, gtk_list_item_get_child(list_item));
   picture = g_object_get_data(G_OBJECT(list_item), "trout_picture");
   if (g_object_get_data(G_OBJECT(picture), "trout_thumbnail_uri") != 0) {
     trout_thumbnailer_unbind_picture(tab->window->thumbnailer, picture);

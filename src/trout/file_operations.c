@@ -1,129 +1,19 @@
+/* Delete through the same bounded worker queue as copy/move. The former
+ * recursive asynchronous job callbacks are no longer used. */
 void
-trout_tab_delete_job_destroy(trout_delete_job *job)
+trout_tab_start_delete_operation(GtkWidget *parent_widget, GFile *source, trout_delete_job *parent)
 {
-  g_object_unref(job->status_label);
-  g_object_unref(job->source);
-  if (job->enumerator != 0) g_object_unref(job->enumerator);
-  g_free(job);
-}
-
-void
-trout_tab_start_delete_operation(GtkWidget *status_label, GFile *source, trout_delete_job *parent)
-{
-  trout_delete_job *job;
-  job = g_new0(trout_delete_job, 1);
-  job->status_label = g_object_ref(status_label);
-  job->source = g_object_ref(source);
-  job->parent = parent;
-  if (parent != 0) parent->pending_children += 1;
-  g_file_delete_async(source, G_PRIORITY_DEFAULT, 0, trout_tab_delete_operation_complete, job);
-}
-
-void
-trout_tab_delete_job_finish(trout_delete_job *job, gboolean failed)
-{
-  trout_delete_job *parent;
-  parent = job->parent;
-  trout_tab_delete_job_destroy(job);
-  if (parent != 0) {
-    if (failed) parent->delete_failed = TRUE;
-    parent->pending_children -= 1;
-    if (parent->delete_enumeration_done && parent->pending_children == 0) {
-      if (parent->delete_failed) trout_tab_delete_job_finish(parent, TRUE);
-      else g_file_delete_async(parent->source, G_PRIORITY_DEFAULT, 0, trout_tab_delete_operation_complete, parent);
-    }
-  }
-}
-
-void
-trout_tab_delete_operation_complete(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-  trout_delete_job *job;
-  GError *error;
-  gboolean succeeded;
-  job = user_data;
-  error = 0;
-  succeeded = g_file_delete_finish(G_FILE(source), result, &error);
-  if (!succeeded && (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_NOT_EMPTY) || g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_RECURSE))) {
-    g_error_free(error);
-    if (job->enumerator != 0) {
-      g_object_unref(job->enumerator);
-      job->enumerator = 0;
-    }
-    job->delete_enumeration_done = FALSE;
-    g_file_enumerate_children_async(job->source, "standard::name", G_FILE_QUERY_INFO_NONE, G_PRIORITY_DEFAULT, 0, trout_tab_delete_directory_enumerated, job);
-    return;
-  }
-  if (!succeeded && error != 0) {
-    trout_tab_show_error(job->status_label, error);
-    g_error_free(error);
-  }
-  trout_tab_delete_job_finish(job, !succeeded);
-}
-
-void
-trout_tab_delete_directory_enumerated(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-  trout_delete_job *job;
-  GError *error;
-  job = user_data;
-  error = 0;
-  job->enumerator = g_file_enumerate_children_finish(G_FILE(source), result, &error);
-  if (job->enumerator == 0) {
-    trout_tab_show_error(job->status_label, error);
-    g_error_free(error);
-    job->delete_enumeration_done = TRUE;
-    job->delete_failed = TRUE;
-    if (job->pending_children == 0) trout_tab_delete_job_finish(job, TRUE);
-    return;
-  }
-  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, 0, trout_tab_delete_directory_next_files, job);
-}
-
-void
-trout_tab_delete_directory_next_files(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-  trout_delete_job *job;
-  GList *file_infos;
-  GList *file_info_node;
-  GFileInfo *file_info;
-  GFile *child;
-  char *name;
-  GError *error;
-  job = user_data;
-  error = 0;
-  file_infos = g_file_enumerator_next_files_finish(G_FILE_ENUMERATOR(source), result, &error);
-  if (file_infos == 0) {
-    if (error != 0) {
-      trout_tab_show_error(job->status_label, error);
-      g_error_free(error);
-      job->delete_enumeration_done = TRUE;
-      job->delete_failed = TRUE;
-      if (job->pending_children == 0) trout_tab_delete_job_finish(job, TRUE);
-      return;
-    }
-    job->delete_enumeration_done = TRUE;
-    g_object_unref(job->enumerator);
-    job->enumerator = 0;
-    if (job->pending_children == 0) {
-      if (job->delete_failed) trout_tab_delete_job_finish(job, TRUE);
-      else g_file_delete_async(job->source, G_PRIORITY_DEFAULT, 0, trout_tab_delete_operation_complete, job);
-    }
-    return;
-  }
-  file_info_node = file_infos;
-  while (file_info_node != 0) {
-    file_info = file_info_node->data;
-    name = g_strdup(g_file_info_get_name(file_info));
-    child = g_file_get_child(job->source, name);
-    trout_tab_start_delete_operation(job->status_label, child, job);
-    g_object_unref(child);
-    g_free(name);
-    g_object_unref(file_info);
-    file_info_node = file_info_node->next;
-  }
-  g_list_free(file_infos);
-  g_file_enumerator_next_files_async(job->enumerator, 64, G_PRIORITY_DEFAULT, 0, trout_tab_delete_directory_next_files, job);
+  GtkRoot *root;
+  trout_window *window;
+  GPtrArray *operations;
+  g_return_if_fail(parent == 0);
+  root = gtk_widget_get_root(parent_widget);
+  if (root == 0) return;
+  window = g_object_get_data(G_OBJECT(root), "trout_window");
+  if (window == 0) return;
+  operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
+  g_ptr_array_add(operations, trout_file_transfer_pair_new(source, source));
+  trout_transfer_request_enqueue(window, operations, trout_file_operation_delete);
 }
 
 void
@@ -191,13 +81,13 @@ trout_tab_enqueue_files(trout_tab *tab, GFile *destination, GSList *files, trout
     name = g_file_get_basename(file);
     if (name != 0) {
       target = g_file_get_child(destination, name);
-      if (!g_file_equal(file, target)) g_ptr_array_add(operations, trout_file_transfer_pair_new(file, target));
+      g_ptr_array_add(operations, trout_file_transfer_pair_new(file, target));
       g_object_unref(target);
       g_free(name);
     }
     file_node = file_node->next;
   }
-  trout_transfer_request_enqueue(tab->window, tab->status_label, operations, operation);
+  trout_transfer_request_enqueue(tab->window, operations, operation);
 }
 
 GdkContentProvider *
@@ -250,7 +140,7 @@ trout_tab_clipboard_read_destroy(trout_clipboard_read *read_data)
   if (read_data->stream != 0) g_object_unref(read_data->stream);
   g_object_unref(read_data->window_widget);
   g_object_unref(read_data->destination);
-  g_object_unref(read_data->status_label);
+  g_object_unref(read_data->parent_widget);
   if (read_data->bytes != 0) g_byte_array_unref(read_data->bytes);
   g_free(read_data);
 }
@@ -269,7 +159,7 @@ trout_tab_paste(trout_tab *tab)
   read_data->window_widget = g_object_ref(tab->window->window);
   destination = tab->context_file_is_directory ? tab->context_file : tab->directory;
   read_data->destination = g_object_ref(destination);
-  read_data->status_label = g_object_ref(tab->status_label);
+  read_data->parent_widget = g_object_ref(tab->root);
   gdk_clipboard_read_async(tab->window->clipboard, (gpointer)mime_types, G_PRIORITY_DEFAULT, 0, trout_tab_clipboard_read_start, read_data);
 }
 
@@ -283,7 +173,7 @@ trout_tab_clipboard_read_start(GObject *source, GAsyncResult *result, gpointer u
   read_data->stream = gdk_clipboard_read_finish(GDK_CLIPBOARD(source), result, 0, &error);
   if (read_data->stream == 0) {
     if (error != 0) {
-      trout_tab_show_error(read_data->status_label, error);
+      trout_tab_show_error(read_data->parent_widget, error);
       g_error_free(error);
     }
     trout_tab_clipboard_read_destroy(read_data);
@@ -316,7 +206,7 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
   chunk = g_input_stream_read_bytes_finish(G_INPUT_STREAM(source), result, &error);
   if (chunk == 0) {
     if (error != 0) {
-      trout_tab_show_error(read_data->status_label, error);
+      trout_tab_show_error(read_data->parent_widget, error);
       g_error_free(error);
     }
     trout_tab_clipboard_read_destroy(read_data);
@@ -343,17 +233,15 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
     name = g_file_get_basename(file);
     if (name != 0) {
       destination = g_file_get_child(read_data->destination, name);
-      if (!g_file_equal(file, destination)) {
-        pair = trout_file_transfer_pair_new(file, destination);
-        g_ptr_array_add(operations, pair);
-      }
+      pair = trout_file_transfer_pair_new(file, destination);
+      g_ptr_array_add(operations, pair);
       g_object_unref(destination);
       g_free(name);
     }
     g_object_unref(file);
     uri += 1;
   }
-  trout_transfer_request_enqueue(read_data->window, read_data->status_label, operations, operation);
+  trout_transfer_request_enqueue(read_data->window, operations, operation);
   g_strfreev(uris);
   g_free(contents);
   trout_tab_clipboard_read_destroy(read_data);
@@ -367,17 +255,20 @@ trout_tab_delete_selection(trout_tab *tab)
   guint position;
   GFileInfo *file_info;
   GFile *file;
+  GPtrArray *operations;
   gboolean has_selection;
+  operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
   selection = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
   has_selection = gtk_bitset_iter_init_first(&iter, selection, &position);
   while (has_selection) {
     file_info = g_list_model_get_item(G_LIST_MODEL(tab->sorted_list), position);
     file = G_FILE(g_file_info_get_attribute_object(file_info, "standard::file"));
-    trout_tab_start_delete_operation(tab->status_label, file, 0);
+    g_ptr_array_add(operations, trout_file_transfer_pair_new(file, file));
     g_object_unref(file_info);
     has_selection = gtk_bitset_iter_next(&iter, &position);
   }
   gtk_bitset_unref(selection);
+  trout_transfer_request_enqueue(tab->window, operations, trout_file_operation_delete);
 }
 
 void
@@ -386,7 +277,7 @@ trout_tab_rename_dialog_destroy(gpointer user_data)
   trout_rename_dialog *rename_data;
   rename_data = user_data;
   g_object_unref(rename_data->source);
-  g_object_unref(rename_data->status_label);
+  g_object_unref(rename_data->owner_widget);
   g_free(rename_data);
 }
 
@@ -395,28 +286,36 @@ trout_tab_rename_accept(GtkWidget *widget, gpointer user_data)
 {
   trout_rename_dialog *rename_data;
   GtkWidget *dialog;
-  GFile *parent;
-  GFile *destination;
+  GtkRoot *owner;
   GPtrArray *operations;
   trout_file_transfer_pair *pair;
   trout_window *window;
+  GError *error;
   char *name;
   rename_data = user_data;
   dialog = GTK_WIDGET(gtk_widget_get_root(widget));
   name = g_strdup(gtk_editable_get_text(GTK_EDITABLE(rename_data->entry)));
   if (name[0] != '\0' && strchr(name, '/') == 0 && strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
-    parent = g_file_get_parent(rename_data->source);
-    destination = g_file_get_child(parent, name);
-    if (!g_file_equal(rename_data->source, destination)) {
-      operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
-      pair = trout_file_transfer_pair_new(rename_data->source, destination);
-      g_ptr_array_add(operations, pair);
-      window = g_object_get_data(G_OBJECT(gtk_widget_get_root(rename_data->status_label)), "trout_window");
-      trout_transfer_request_enqueue(window, rename_data->status_label, operations, trout_file_operation_move);
+    owner = gtk_widget_get_root(rename_data->owner_widget);
+    if (owner != 0) {
+      window = g_object_get_data(G_OBJECT(owner), "trout_window");
+      error = 0;
+      pair = trout_file_transfer_pair_new_rename(rename_data->source, name, &error);
+      if (pair == 0) {
+        if (error != 0) {
+          trout_tab_show_error(rename_data->owner_widget, error);
+          g_error_free(error);
+        }
+      } else {
+        if (g_file_equal(trout_file_transfer_pair_get_source(pair), trout_file_transfer_pair_get_destination(pair))) trout_file_transfer_pair_destroy(pair);
+        else {
+          operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
+          g_ptr_array_add(operations, pair);
+          trout_transfer_request_enqueue(window, operations, trout_file_operation_rename);
+        }
+        gtk_window_destroy(GTK_WINDOW(dialog));
+      }
     }
-    g_object_unref(destination);
-    g_object_unref(parent);
-    gtk_window_destroy(GTK_WINDOW(dialog));
   }
   g_free(name);
 }
@@ -435,7 +334,6 @@ trout_tab_create_dialog_destroy(gpointer user_data)
   create_data = user_data;
   g_object_unref(create_data->directory);
   g_object_unref(create_data->root);
-  g_object_unref(create_data->status_label);
   g_free(create_data);
 }
 
@@ -465,7 +363,7 @@ trout_tab_create_request_destroy(gpointer user_data)
 }
 
 void
-trout_tab_create_dialog_accept(GtkButton *button, gpointer user_data)
+trout_tab_create_dialog_accept(GtkWidget *widget, gpointer user_data)
 {
   trout_create_dialog *create_data;
   trout_create_request *request;
@@ -484,7 +382,7 @@ trout_tab_create_dialog_accept(GtkButton *button, gpointer user_data)
   gtk_widget_set_sensitive(create_data->create_button, FALSE);
   gtk_widget_set_sensitive(create_data->cancel_button, FALSE);
   gtk_label_set_text(GTK_LABEL(create_data->message), "Creating…");
-  task = g_task_new(G_OBJECT(gtk_widget_get_root(GTK_WIDGET(button))), 0, trout_tab_create_complete, 0);
+  task = g_task_new(G_OBJECT(gtk_widget_get_root(widget)), 0, trout_tab_create_complete, 0);
   g_task_set_task_data(task, request, trout_tab_create_request_destroy);
   g_task_run_in_thread(task, trout_tab_create_worker);
   g_object_unref(task);
@@ -541,7 +439,6 @@ trout_tab_create_complete(GObject *source_object, GAsyncResult *result, gpointer
     name = (char *)gtk_editable_get_text(GTK_EDITABLE(create_data->entry));
     gtk_widget_set_sensitive(create_data->create_button, trout_tab_create_name_is_valid(name));
     gtk_label_set_text(GTK_LABEL(create_data->message), error->message);
-    trout_tab_show_error(create_data->status_label, error);
     g_error_free(error);
   }
   (void)user_data;
@@ -573,7 +470,6 @@ trout_tab_create_named_entry(trout_tab *tab, gboolean create_directory)
   create_data->tab = tab;
   create_data->directory = g_object_ref(tab->directory);
   create_data->root = g_object_ref(tab->root);
-  create_data->status_label = g_object_ref(tab->status_label);
   create_data->create_directory = create_directory;
   g_object_set_data_full(G_OBJECT(dialog), "trout_create_data", create_data, trout_tab_create_dialog_destroy);
   content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -598,6 +494,7 @@ trout_tab_create_named_entry(trout_tab *tab, gboolean create_directory)
   gtk_widget_set_sensitive(create_button, FALSE);
   g_signal_connect(cancel_button, "clicked", G_CALLBACK(trout_tab_create_dialog_cancel), create_data);
   g_signal_connect(create_button, "clicked", G_CALLBACK(trout_tab_create_dialog_accept), create_data);
+  g_signal_connect(entry, "activate", G_CALLBACK(trout_tab_create_dialog_accept), create_data);
   g_signal_connect(entry, "changed", G_CALLBACK(trout_tab_create_dialog_changed), create_data);
   gtk_box_append(GTK_BOX(buttons), cancel_button);
   gtk_box_append(GTK_BOX(buttons), create_button);
@@ -652,7 +549,7 @@ trout_tab_rename_context_file(trout_tab *tab)
   gtk_window_set_default_size(GTK_WINDOW(dialog), 360, -1);
   rename_data = g_new0(trout_rename_dialog, 1);
   rename_data->source = g_object_ref(tab->context_file);
-  rename_data->status_label = g_object_ref(tab->status_label);
+  rename_data->owner_widget = g_object_ref(tab->root);
   g_object_set_data_full(G_OBJECT(dialog), "trout_rename_data", rename_data, trout_tab_rename_dialog_destroy);
   content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_widget_set_margin_start(content, 12);
@@ -662,8 +559,12 @@ trout_tab_rename_context_file(trout_tab *tab)
   entry = gtk_entry_new();
   rename_data->entry = entry;
   name = g_file_get_basename(tab->context_file);
-  gtk_editable_set_text(GTK_EDITABLE(entry), name);
-  g_free(name);
+  if (name != 0) {
+    char *display_name = g_file_is_native(tab->context_file) ? g_filename_display_name(name) : g_utf8_make_valid(name, -1);
+    gtk_editable_set_text(GTK_EDITABLE(entry), display_name);
+    g_free(display_name);
+    g_free(name);
+  }
   gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
   gtk_box_append(GTK_BOX(content), entry);
   buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);

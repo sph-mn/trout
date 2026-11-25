@@ -766,6 +766,12 @@ trout_thumbnailer_file_kind(trout_thumbnailer *thumbnailer, char *name)
 }
 
 gboolean
+trout_thumbnailer_file_name_is_thumbnailable(trout_thumbnailer *thumbnailer, char *name)
+{
+  return trout_thumbnailer_file_kind(thumbnailer, name) != 0;
+}
+
+gboolean
 trout_thumbnailer_has_pictures(trout_thumbnailer *thumbnailer, char *uri)
 {
   gboolean has_pictures;
