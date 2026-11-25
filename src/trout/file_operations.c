@@ -245,9 +245,55 @@ trout_tab_clipboard_read_chunk(GObject *source, GAsyncResult *result, gpointer u
   trout_tab_clipboard_read_destroy(read_data);
 }
 
+static void
+trout_delete_confirmation_destroy(gpointer user_data)
+{
+  trout_delete_confirmation *confirmation;
+  confirmation = user_data;
+  g_clear_object(&confirmation->owner_widget);
+  if (confirmation->operations != 0) g_ptr_array_unref(confirmation->operations);
+  g_free(confirmation);
+}
+
+static void
+trout_delete_confirmation_cancel(GtkButton *button, gpointer user_data)
+{
+  GtkRoot *root;
+  root = gtk_widget_get_root(GTK_WIDGET(button));
+  gtk_window_destroy(GTK_WINDOW(root));
+  (void)user_data;
+}
+
+static void
+trout_delete_confirmation_accept(GtkButton *button, gpointer user_data)
+{
+  GtkRoot *dialog_root;
+  GtkRoot *owner_root;
+  trout_delete_confirmation *confirmation;
+  trout_window *window;
+  dialog_root = gtk_widget_get_root(GTK_WIDGET(button));
+  confirmation = g_object_get_data(G_OBJECT(dialog_root), "trout_delete_confirmation");
+  owner_root = gtk_widget_get_root(confirmation->owner_widget);
+  window = owner_root != 0 ? g_object_get_data(G_OBJECT(owner_root), "trout_window") : 0;
+  if (window != 0) {
+    trout_transfer_request_enqueue(window, confirmation->operations, trout_file_operation_delete);
+    confirmation->operations = 0;
+  }
+  gtk_window_destroy(GTK_WINDOW(dialog_root));
+  (void)user_data;
+}
+
 void
 trout_tab_delete_selection(trout_tab *tab)
 {
+  trout_delete_confirmation *confirmation;
+  GtkRoot *parent;
+  GtkWidget *dialog;
+  GtkWidget *content;
+  GtkWidget *message;
+  GtkWidget *buttons;
+  GtkWidget *cancel_button;
+  GtkWidget *delete_button;
   GtkBitset *selection;
   GtkBitsetIter iter;
   guint position;
@@ -266,7 +312,50 @@ trout_tab_delete_selection(trout_tab *tab)
     has_selection = gtk_bitset_iter_next(&iter, &position);
   }
   gtk_bitset_unref(selection);
-  trout_transfer_request_enqueue(tab->window, operations, trout_file_operation_delete);
+  if (operations->len == 0) {
+    g_ptr_array_unref(operations);
+    return;
+  }
+  confirmation = g_new(trout_delete_confirmation, 1);
+  confirmation->owner_widget = g_object_ref(tab->root);
+  confirmation->operations = operations;
+  dialog = gtk_window_new();
+  gtk_window_set_title(GTK_WINDOW(dialog), "Confirm Deletion");
+  gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+  gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+  parent = gtk_widget_get_root(tab->root);
+  if (parent != 0 && GTK_IS_WINDOW(parent)) {
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(parent));
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
+  }
+  g_object_set_data_full(G_OBJECT(dialog), "trout_delete_confirmation", confirmation, trout_delete_confirmation_destroy);
+  content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start(content, 12);
+  gtk_widget_set_margin_end(content, 12);
+  gtk_widget_set_margin_top(content, 12);
+  gtk_widget_set_margin_bottom(content, 12);
+  if (operations->len == 1) message = gtk_label_new("Permanently delete this item and its directory contents? This cannot be undone.");
+  else {
+    char *text = g_strdup_printf("Permanently delete %u selected items and their directory contents? This cannot be undone.", operations->len);
+    message = gtk_label_new(text);
+    g_free(text);
+  }
+  gtk_label_set_xalign(GTK_LABEL(message), 0.0f);
+  gtk_label_set_wrap(GTK_LABEL(message), TRUE);
+  gtk_box_append(GTK_BOX(content), message);
+  buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  gtk_widget_set_halign(buttons, GTK_ALIGN_END);
+  cancel_button = gtk_button_new_with_label("Cancel");
+  delete_button = gtk_button_new_with_label("Delete Permanently");
+  gtk_widget_add_css_class(delete_button, "destructive-action");
+  g_signal_connect(cancel_button, "clicked", G_CALLBACK(trout_delete_confirmation_cancel), 0);
+  g_signal_connect(delete_button, "clicked", G_CALLBACK(trout_delete_confirmation_accept), 0);
+  gtk_box_append(GTK_BOX(buttons), cancel_button);
+  gtk_box_append(GTK_BOX(buttons), delete_button);
+  gtk_box_append(GTK_BOX(content), buttons);
+  gtk_window_set_child(GTK_WINDOW(dialog), content);
+  gtk_window_set_default_widget(GTK_WINDOW(dialog), cancel_button);
+  gtk_window_present(GTK_WINDOW(dialog));
 }
 
 void
@@ -759,9 +848,7 @@ trout_tab_properties_done(GObject *source_object, GAsyncResult *result, gpointer
   trout_properties_request *request;
   trout_properties_result *properties;
   GError *error;
-  char *summary;
   char *size_text;
-  char *status_text;
   char *text;
   request = g_task_get_task_data(G_TASK(result));
   tab = g_object_get_data(G_OBJECT(source_object), "trout_tab");
@@ -771,14 +858,8 @@ trout_tab_properties_done(GObject *source_object, GAsyncResult *result, gpointer
   if (tab != 0 && properties != 0 && request->generation == tab->properties_generation && gtk_widget_get_root(tab->root) != 0) {
     g_clear_object(&tab->properties_cancellable);
     size_text = trout_format_size(properties->size, properties->incomplete);
-    if (request->selection_count == 0) text = g_strdup_printf("Directory size: %s", size_text);
-    else if (request->selection_count == 1) text = g_strdup_printf("Selected size: %s", size_text);
-    else text = g_strdup_printf("Size of %u selected items: %s", request->selection_count, size_text);
-    summary = trout_tab_status_summary(tab);
-    status_text = g_strdup_printf("%s    %s", summary, text);
-    gtk_label_set_text(GTK_LABEL(tab->status_label), status_text);
-    g_free(status_text);
-    g_free(summary);
+    text = g_strdup_printf("Size: %s", size_text);
+    gtk_label_set_text(GTK_LABEL(tab->properties_label), text);
     g_free(size_text);
     g_free(text);
   }
@@ -792,9 +873,6 @@ trout_tab_show_properties(trout_tab *tab)
   trout_properties_request *request;
   GCancellable *cancellable;
   GTask *task;
-  char *summary;
-  char *status_text;
-  char *text;
   if (tab->properties_cancellable != 0) {
     g_cancellable_cancel(tab->properties_cancellable);
     g_clear_object(&tab->properties_cancellable);
@@ -805,14 +883,7 @@ trout_tab_show_properties(trout_tab *tab)
   tab->properties_generation = request->generation;
   cancellable = g_cancellable_new();
   tab->properties_cancellable = g_object_ref(cancellable);
-  if (request->selection_count == 0) text = g_strdup("Calculating directory size…");
-  else text = g_strdup_printf("Calculating size of %u selected items…", request->selection_count);
-  summary = trout_tab_status_summary(tab);
-  status_text = g_strdup_printf("%s    %s", summary, text);
-  gtk_label_set_text(GTK_LABEL(tab->status_label), status_text);
-  g_free(status_text);
-  g_free(summary);
-  g_free(text);
+  gtk_label_set_text(GTK_LABEL(tab->properties_label), "Calculating…");
   task = g_task_new(G_OBJECT(tab->root), cancellable, trout_tab_properties_done, 0);
   g_task_set_task_data(task, request, trout_tab_properties_request_destroy);
   g_task_run_in_thread(task, trout_tab_properties_worker);
@@ -844,7 +915,7 @@ trout_tab_append_context_menu(trout_tab *tab, GtkWidget *popover, GtkWidget *men
   if (has_context_entry) {
     gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Rename", "rename", tab, popover));
     button = trout_tab_make_context_button("Delete", "delete", tab, popover);
-    gtk_widget_set_sensitive(button, FALSE);
+    gtk_widget_set_sensitive(button, has_selection);
     gtk_box_append(GTK_BOX(menu_items), button);
   }
   gtk_box_append(GTK_BOX(menu_items), trout_tab_make_context_button("Properties", "properties", tab, popover));

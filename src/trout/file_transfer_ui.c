@@ -384,31 +384,25 @@ trout_transfer_request_update_window(trout_window *window)
   trout_transfer_request *request;
   guint active_count;
   guint queued_count;
-  double progress_fraction;
   gboolean collision_dialog_active;
   char *status;
   if (window->transfer_dialog == 0) return;
   active_count = 0;
   queued_count = 0;
-  progress_fraction = 0.0;
   collision_dialog_active = FALSE;
   for (link = window->transfer_queue.head; link != 0; link = link->next) {
     request = link->data;
     if (request->active) {
       active_count += 1;
-      progress_fraction += request->progress_fraction;
       collision_dialog_active = collision_dialog_active || window->transfer_scheduler->collision_owner == request;
     } else queued_count += 1;
   }
   if (active_count > 0) {
-    progress_fraction /= active_count;
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(window->transfer_progress), progress_fraction);
     status = window->transfer_queue_paused ? g_strdup_printf("Paused · %u operations running · %u queued", active_count, queued_count) :
         g_strdup_printf("%u operations running · %u queued", active_count, queued_count);
     gtk_label_set_text(GTK_LABEL(window->transfer_label), status);
     g_free(status);
   } else if (queued_count > 0) {
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(window->transfer_progress), 0.0);
     status = window->transfer_queue_paused ? g_strdup_printf("Paused · %u queued", queued_count) :
         g_strdup_printf("Waiting for available filesystems · %u queued", queued_count);
     gtk_label_set_text(GTK_LABEL(window->transfer_label), status);
@@ -416,8 +410,6 @@ trout_transfer_request_update_window(trout_window *window)
   }
   gtk_widget_set_sensitive(window->transfer_pause_button, (active_count > 0 || queued_count > 0) && !collision_dialog_active);
   gtk_button_set_label(GTK_BUTTON(window->transfer_pause_button), window->transfer_queue_paused ? "Resume" : "Pause");
-  gtk_widget_set_sensitive(window->transfer_cancel_button, active_count > 0);
-  gtk_button_set_label(GTK_BUTTON(window->transfer_cancel_button), active_count > 0 ? "Cancel Active" : "Cancel");
 }
 
 void
@@ -541,12 +533,11 @@ trout_transfer_queue_close_dialog(trout_window *window)
   gtk_window_destroy(GTK_WINDOW(window->transfer_dialog));
   window->transfer_dialog = 0;
   window->transfer_label = 0;
-  window->transfer_progress = 0;
   window->transfer_error_label = 0;
   window->transfer_queue_scroller = 0;
   window->transfer_queue_list = 0;
   window->transfer_pause_button = 0;
-  window->transfer_cancel_button = 0;
+  window->transfer_close_button = 0;
   window->transfer_had_failure = FALSE;
 }
 
@@ -576,10 +567,8 @@ static void
 trout_transfer_queue_show_finished_failure(trout_window *window)
 {
   gtk_label_set_text(GTK_LABEL(window->transfer_label), window->transfer_had_failure ? "Operation failed" : "Operations finished with skips or cancellations");
-  if (window->transfer_had_failure) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(window->transfer_progress), 0.0);
   gtk_widget_set_sensitive(window->transfer_pause_button, FALSE);
-  gtk_widget_set_sensitive(window->transfer_cancel_button, TRUE);
-  gtk_button_set_label(GTK_BUTTON(window->transfer_cancel_button), "Close");
+  gtk_widget_set_visible(window->transfer_close_button, TRUE);
 }
 
 void
@@ -748,7 +737,7 @@ trout_transfer_request_enqueue(trout_window *window, GPtrArray *operations, trou
   GtkWidget *queue_scroller;
   GtkWidget *queue_list;
   GtkWidget *pause_button;
-  GtkWidget *cancel_button;
+  GtkWidget *close_button;
   if (operations->len == 0) {
     g_ptr_array_unref(operations);
     return;
@@ -783,7 +772,6 @@ trout_transfer_request_enqueue(trout_window *window, GPtrArray *operations, trou
     gtk_widget_set_margin_bottom(content, 12);
     window->transfer_label = gtk_label_new(0);
     gtk_label_set_xalign(GTK_LABEL(window->transfer_label), 0.0f);
-    window->transfer_progress = gtk_progress_bar_new();
     window->transfer_error_label = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(window->transfer_error_label), 0.0f);
     gtk_label_set_wrap(GTK_LABEL(window->transfer_error_label), TRUE);
@@ -800,15 +788,15 @@ trout_transfer_request_enqueue(trout_window *window, GPtrArray *operations, trou
     pause_button = gtk_button_new_with_label("Pause");
     window->transfer_pause_button = pause_button;
     g_signal_connect(pause_button, "clicked", G_CALLBACK(trout_transfer_pause), window);
-    cancel_button = gtk_button_new_with_label("Cancel");
-    window->transfer_cancel_button = cancel_button;
-    g_signal_connect(cancel_button, "clicked", G_CALLBACK(trout_transfer_cancel), window);
+    close_button = gtk_button_new_with_label("Close");
+    window->transfer_close_button = close_button;
+    gtk_widget_set_visible(close_button, FALSE);
+    g_signal_connect(close_button, "clicked", G_CALLBACK(trout_transfer_queue_close), window);
     gtk_box_append(GTK_BOX(content), window->transfer_label);
-    gtk_box_append(GTK_BOX(content), window->transfer_progress);
     gtk_box_append(GTK_BOX(content), window->transfer_error_label);
     gtk_box_append(GTK_BOX(content), queue_scroller);
     gtk_box_append(GTK_BOX(buttons), pause_button);
-    gtk_box_append(GTK_BOX(buttons), cancel_button);
+    gtk_box_append(GTK_BOX(buttons), close_button);
     gtk_box_append(GTK_BOX(content), buttons);
     gtk_window_set_child(GTK_WINDOW(window->transfer_dialog), content);
   }
@@ -869,22 +857,11 @@ trout_transfer_pause(GtkButton *button, gpointer user_data)
 }
 
 void
-trout_transfer_cancel(GtkButton *button, gpointer user_data)
+trout_transfer_queue_close(GtkButton *button, gpointer user_data)
 {
   trout_window *window;
-  GList *link;
-  trout_transfer_request *request;
-  gboolean active;
   window = user_data;
-  active = FALSE;
-  for (link = window->transfer_queue.head; link != 0; link = link->next) {
-    request = link->data;
-    if (request->active) {
-      active = TRUE;
-      trout_transfer_request_cancel(request);
-    }
-  }
-  if (!active && trout_transfer_queue_has_notice(window) && g_queue_is_empty(&window->transfer_queue)) trout_transfer_queue_close_dialog(window);
+  trout_transfer_queue_close_dialog(window);
   (void)button;
 }
 
@@ -900,10 +877,7 @@ trout_file_operation_progress_update(gpointer user_data)
     request->current_name = g_strdup(update->name != 0 ? update->name : "file");
     if (update->total_bytes > 0) request->progress_fraction = CLAMP((double)update->current_bytes / update->total_bytes, 0.0, 1.0);
     trout_transfer_request_update_label(request);
-    if (update->total_bytes <= 0) {
-      gtk_progress_bar_pulse(GTK_PROGRESS_BAR(request->window->transfer_progress));
-      if (request->queue_progress != 0) gtk_progress_bar_pulse(GTK_PROGRESS_BAR(request->queue_progress));
-    }
+    if (update->total_bytes <= 0 && request->queue_progress != 0) gtk_progress_bar_pulse(GTK_PROGRESS_BAR(request->queue_progress));
   }
   return FALSE;
 }

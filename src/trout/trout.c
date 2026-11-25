@@ -47,6 +47,7 @@
 typedef struct trout_window trout_window;
 typedef struct trout_tab trout_tab;
 typedef struct trout_delete_job trout_delete_job;
+typedef struct trout_delete_confirmation trout_delete_confirmation;
 typedef struct trout_clipboard_read trout_clipboard_read;
 typedef struct trout_rename_dialog trout_rename_dialog;
 typedef struct trout_preferences trout_preferences;
@@ -93,12 +94,11 @@ struct trout_window {
   gboolean updating_sort_menu;
   GtkWidget *transfer_dialog;
   GtkWidget *transfer_label;
-  GtkWidget *transfer_progress;
   GtkWidget *transfer_error_label;
   GtkWidget *transfer_queue_scroller;
   GtkWidget *transfer_queue_list;
   GtkWidget *transfer_pause_button;
-  GtkWidget *transfer_cancel_button;
+  GtkWidget *transfer_close_button;
   GQueue transfer_queue;
   gboolean transfer_queue_paused;
   gboolean transfer_had_failure;
@@ -129,6 +129,7 @@ struct trout_tab {
   GtkWidget *grid;
   GtkWidget *status_label;
   GtkWidget *free_space_label;
+  GtkWidget *properties_label;
   GtkWidget *context_popover;
   GFile *context_file;
   gboolean context_file_is_directory;
@@ -168,6 +169,11 @@ struct trout_delete_job {
   guint pending_children;
   gboolean delete_enumeration_done;
   gboolean delete_failed;
+};
+
+struct trout_delete_confirmation {
+  GtkWidget *owner_widget;
+  GPtrArray *operations;
 };
 
 struct trout_transfer_prompt {
@@ -287,7 +293,6 @@ struct trout_free_space_query {
 };
 
 void trout_tab_update_location(trout_tab *tab);
-char *trout_tab_status_summary(trout_tab *tab);
 void trout_tab_update_status(trout_tab *tab);
 void trout_tab_update_free_space(trout_tab *tab);
 void trout_tab_free_space_complete(GObject *source_object, GAsyncResult *result, gpointer user_data);
@@ -413,7 +418,7 @@ void trout_transfer_request_worker(GTask *task, gpointer source_object, gpointer
 void trout_transfer_request_complete(GObject *source, GAsyncResult *result, gpointer user_data);
 void trout_transfer_request_unref(gpointer user_data);
 void trout_transfer_pause(GtkButton *button, gpointer user_data);
-void trout_transfer_cancel(GtkButton *button, gpointer user_data);
+void trout_transfer_queue_close(GtkButton *button, gpointer user_data);
 gboolean trout_file_operation_progress_update(gpointer user_data);
 void trout_file_operation_progress_update_destroy(gpointer user_data);
 void trout_tab_start_delete_operation(GtkWidget *parent_widget, GFile *source, trout_delete_job *parent);
@@ -1449,16 +1454,18 @@ trout_tab_create(trout_window *window, GFile *directory)
   tab->grid = trout_tab_build_grid(tab);
   gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), tab->grid);
   gtk_box_append(GTK_BOX(root), scrolled);
-  status_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+  status_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   status = gtk_label_new(0);
   tab->status_label = status;
   gtk_label_set_xalign(GTK_LABEL(status), 0.0f);
-  gtk_widget_set_hexpand(status, TRUE);
   tab->free_space_label = gtk_label_new("");
   free_space = tab->free_space_label;
   gtk_label_set_xalign(GTK_LABEL(free_space), 0.0f);
+  tab->properties_label = gtk_label_new("");
+  gtk_label_set_xalign(GTK_LABEL(tab->properties_label), 0.0f);
   gtk_box_append(GTK_BOX(status_bar), status);
   gtk_box_append(GTK_BOX(status_bar), free_space);
+  gtk_box_append(GTK_BOX(status_bar), tab->properties_label);
   gtk_widget_set_margin_start(status_bar, 8);
   gtk_widget_set_margin_end(status_bar, 8);
   gtk_widget_set_margin_top(status_bar, 4);

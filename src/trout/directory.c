@@ -102,34 +102,27 @@ trout_tab_set_sort_order(trout_tab *tab, guint sort_order)
   }
 }
 
-char *
-trout_tab_status_summary(trout_tab *tab)
+void
+trout_tab_update_status(trout_tab *tab)
 {
   guint file_count;
   GtkBitset *selected;
   guint selected_count;
-  char *text;
-  file_count = g_list_model_get_n_items(G_LIST_MODEL(tab->filtered_list));
-  selected = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
-  selected_count = gtk_bitset_get_size(selected);
-  if (gtk_directory_list_is_loading(tab->directory_list)) text = g_strdup_printf("%u selected", selected_count);
-  else text = g_strdup_printf("%u items    %u selected", file_count, selected_count);
-  gtk_bitset_unref(selected);
-  return text;
-}
-
-void
-trout_tab_update_status(trout_tab *tab)
-{
   char *text;
   tab->properties_generation += 1;
   if (tab->properties_cancellable != 0) {
     g_cancellable_cancel(tab->properties_cancellable);
     g_clear_object(&tab->properties_cancellable);
   }
-  text = trout_tab_status_summary(tab);
+  gtk_label_set_text(GTK_LABEL(tab->properties_label), "");
+  file_count = g_list_model_get_n_items(G_LIST_MODEL(tab->filtered_list));
+  selected = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
+  selected_count = gtk_bitset_get_size(selected);
+  if (gtk_directory_list_is_loading(tab->directory_list)) text = g_strdup_printf("%u selected", selected_count);
+  else text = g_strdup_printf("%u items    %u selected", file_count, selected_count);
   gtk_label_set_text(GTK_LABEL(tab->status_label), text);
   g_free(text);
+  gtk_bitset_unref(selected);
 }
 
 gboolean
