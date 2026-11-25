@@ -9,7 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define trout_transfer_attributes "standard::type,standard::size,id::filesystem,id::file,unix::device,unix::inode,unix::mode,unix::is-mountpoint,time::modified,time::modified-usec,time::modified-nsec,time::access,time::access-usec,time::access-nsec"
+#define trout_transfer_attributes "standard::name,standard::type,standard::size,id::filesystem,id::file,unix::device,unix::inode,unix::mode,unix::is-mountpoint,time::modified,time::modified-usec,time::modified-nsec,time::access,time::access-usec,time::access-nsec"
 #define trout_transfer_unit ((goffset)1000000)
 #define trout_transfer_flags (G_FILE_COPY_NOFOLLOW_SYMLINKS | G_FILE_COPY_ALL_METADATA)
 
@@ -17,6 +17,12 @@ struct trout_file_transfer_pair {
   GFile *source;
   GFile *destination;
   char *display_name;
+};
+
+typedef struct trout_transfer_access_node trout_transfer_access_node;
+struct trout_transfer_access_node {
+  GFile *file;
+  GFileInfo *info;
 };
 
 typedef struct trout_transfer_node trout_transfer_node;
@@ -470,28 +476,25 @@ trout_transfer_entry(trout_transfer_node *node, trout_file_operation operation, 
   source_type = g_file_info_get_file_type(node->info);
   destination_type = destination_info != 0 ? g_file_info_get_file_type(destination_info) : G_FILE_TYPE_UNKNOWN;
   if (destination_info != 0) {
-    if (context->callbacks == 0 || context->callbacks->collision == 0) {
-      g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_EXISTS, "Destination already exists; no collision policy supplied");
-      goto done;
-    }
-    choice = context->callbacks->collision(node->source, node->destination, context->source_root, context->destination_root, source_type, destination_type, g_file_info_get_size(node->info), g_file_info_get_size(destination_info), context->callbacks->user_data);
-    if (choice == trout_file_collision_skip) {
-      context->skipped = node->skipped = node->omitted = TRUE;
-      succeeded = TRUE;
-      goto done;
-    }
-    if (choice == trout_file_collision_cancel) {
-      g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Transfer cancelled");
-      goto done;
-    }
-    if (trout_file_transfer_should_merge(source_type, destination_type)) {
-      if (choice != trout_file_collision_merge) {
-        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Directory merge requires explicit approval");
+    if (!trout_file_transfer_should_merge(source_type, destination_type)) {
+      if (context->callbacks == 0 || context->callbacks->collision == 0) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_EXISTS, "Destination already exists; no collision policy supplied");
         goto done;
       }
-    } else if (choice != trout_file_collision_replace || source_type == G_FILE_TYPE_DIRECTORY || destination_type == G_FILE_TYPE_DIRECTORY) {
-      g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Refusing to replace a directory with a non-directory or vice versa");
-      goto done;
+      choice = context->callbacks->collision(node->source, node->destination, context->source_root, context->destination_root, source_type, destination_type, g_file_info_get_size(node->info), g_file_info_get_size(destination_info), context->callbacks->user_data);
+      if (choice == trout_file_collision_skip) {
+        context->skipped = node->skipped = node->omitted = TRUE;
+        succeeded = TRUE;
+        goto done;
+      }
+      if (choice == trout_file_collision_cancel) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Transfer cancelled");
+        goto done;
+      }
+      if (choice != trout_file_collision_replace || source_type == G_FILE_TYPE_DIRECTORY || destination_type == G_FILE_TYPE_DIRECTORY) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "Refusing to replace a directory with a non-directory or vice versa");
+        goto done;
+      }
     }
     if (!trout_transfer_wait(context, error) || !trout_transfer_revalidate_parent(node, context, error) ||
         !trout_transfer_revalidate(node->source, node->info, context->cancellable, error) ||
@@ -793,6 +796,194 @@ gboolean
 trout_file_transfer_should_merge(GFileType source_type, GFileType destination_type)
 {
   return source_type == G_FILE_TYPE_DIRECTORY && destination_type == G_FILE_TYPE_DIRECTORY;
+}
+
+static char *
+trout_transfer_filesystem_key(GFileInfo *info)
+{
+  const char *filesystem;
+  if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_DEVICE))
+    return g_strdup_printf("unix:%" G_GUINT32_FORMAT, g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_DEVICE));
+  filesystem = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_ID_FILESYSTEM);
+  if (filesystem != 0) return g_strdup_printf("gio:%s", filesystem);
+  return 0;
+}
+
+static GFileInfo *
+trout_transfer_filesystem_query(GFile *file)
+{
+  GError *error = 0;
+  GFileInfo *info = g_file_query_info(file, trout_transfer_attributes, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, 0, &error);
+  g_clear_error(&error);
+  return info;
+}
+
+static char *
+trout_transfer_parent_filesystem_key(GFile *file)
+{
+  GFile *candidate;
+  GFile *parent;
+  GFileInfo *info;
+  char *key;
+  candidate = g_file_get_parent(file);
+  if (candidate == 0) candidate = g_object_ref(file);
+  key = 0;
+  while (candidate != 0 && key == 0) {
+    info = trout_transfer_filesystem_query(candidate);
+    if (info != 0) {
+      key = trout_transfer_filesystem_key(info);
+      g_object_unref(info);
+    }
+    parent = key == 0 ? g_file_get_parent(candidate) : 0;
+    g_object_unref(candidate);
+    candidate = parent;
+  }
+  return key;
+}
+
+static void
+trout_transfer_access_add(GHashTable *filesystems, char *key, trout_file_transfer_access *access)
+{
+  if (key != 0) g_hash_table_add(filesystems, key);
+  else access->exclusive = TRUE;
+}
+
+static void
+trout_transfer_access_add_tree(trout_file_transfer_access *access, GFile *file, GHashTable *filesystems, GFileInfo *root_info)
+{
+  GQueue pending;
+  GFileEnumerator *enumerator;
+  GFileInfo *info;
+  trout_transfer_access_node *node;
+  trout_transfer_access_node *child_node;
+  GFile *child;
+  GError *error;
+  char *key;
+  const char *name;
+  g_queue_init(&pending);
+  info = root_info != 0 ? g_object_ref(root_info) : trout_transfer_filesystem_query(file);
+  if (info == 0) {
+    access->exclusive = TRUE;
+    return;
+  }
+  node = g_new(trout_transfer_access_node, 1);
+  node->file = g_object_ref(file);
+  node->info = info;
+  g_queue_push_tail(&pending, node);
+  while ((node = g_queue_pop_head(&pending)) != 0) {
+    key = trout_transfer_filesystem_key(node->info);
+    trout_transfer_access_add(filesystems, key, access);
+    if (g_file_info_get_file_type(node->info) == G_FILE_TYPE_DIRECTORY) {
+      error = 0;
+      enumerator = g_file_enumerate_children(node->file, trout_transfer_attributes, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, 0, &error);
+      if (enumerator == 0) {
+        access->exclusive = TRUE;
+        g_clear_error(&error);
+      } else {
+        while ((info = g_file_enumerator_next_file(enumerator, 0, &error)) != 0) {
+          if (g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
+            name = g_file_info_get_name(info);
+            child = g_file_get_child(node->file, name);
+            child_node = g_new(trout_transfer_access_node, 1);
+            child_node->file = child;
+            child_node->info = info;
+            g_queue_push_tail(&pending, child_node);
+          } else {
+            key = trout_transfer_filesystem_key(info);
+            trout_transfer_access_add(filesystems, key, access);
+            g_object_unref(info);
+          }
+        }
+        if (error != 0) access->exclusive = TRUE;
+        g_clear_error(&error);
+        if (!g_file_enumerator_close(enumerator, 0, &error)) access->exclusive = TRUE;
+        g_clear_error(&error);
+        g_object_unref(enumerator);
+      }
+    }
+    g_object_unref(node->file);
+    g_object_unref(node->info);
+    g_free(node);
+  }
+}
+
+trout_file_transfer_access *
+trout_file_transfer_access_new(GPtrArray *operations, trout_file_operation operation)
+{
+  trout_file_transfer_access *access;
+  trout_file_transfer_pair *pair;
+  GFileInfo *source_info;
+  GFileInfo *destination_info;
+  GFileType source_type;
+  GFileType destination_type;
+  char *destination_key;
+  GHashTableIter iterator;
+  gpointer key;
+  guint index;
+  access = g_new0(trout_file_transfer_access, 1);
+  access->read_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
+  access->write_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
+  for (index = 0; index < operations->len; index += 1) {
+    pair = g_ptr_array_index(operations, index);
+    if (operation == trout_file_operation_delete) {
+      trout_transfer_access_add_tree(access, pair->source, access->write_filesystems, 0);
+      continue;
+    }
+    if (operation == trout_file_operation_rename) {
+      destination_key = trout_transfer_parent_filesystem_key(pair->source);
+      trout_transfer_access_add(access->write_filesystems, destination_key, access);
+      destination_key = trout_transfer_parent_filesystem_key(pair->destination);
+      trout_transfer_access_add(access->write_filesystems, destination_key, access);
+      continue;
+    }
+    source_info = trout_transfer_filesystem_query(pair->source);
+    source_type = source_info != 0 ? g_file_info_get_file_type(source_info) : G_FILE_TYPE_UNKNOWN;
+    destination_info = trout_transfer_filesystem_query(pair->destination);
+    destination_type = destination_info != 0 ? g_file_info_get_file_type(destination_info) : G_FILE_TYPE_UNKNOWN;
+    trout_transfer_access_add_tree(access, pair->source, access->read_filesystems, source_info);
+    if (trout_file_transfer_should_merge(source_type, destination_type))
+      trout_transfer_access_add_tree(access, pair->destination, access->write_filesystems, destination_info);
+    else {
+      destination_key = trout_transfer_parent_filesystem_key(pair->destination);
+      trout_transfer_access_add(access->write_filesystems, destination_key, access);
+    }
+    g_clear_object(&source_info);
+    g_clear_object(&destination_info);
+  }
+  g_hash_table_iter_init(&iterator, access->read_filesystems);
+  while (g_hash_table_iter_next(&iterator, &key, 0)) {
+    if (g_hash_table_contains(access->write_filesystems, key)) g_hash_table_iter_remove(&iterator);
+  }
+  return access;
+}
+
+void
+trout_file_transfer_access_destroy(trout_file_transfer_access *access)
+{
+  g_hash_table_unref(access->read_filesystems);
+  g_hash_table_unref(access->write_filesystems);
+  g_free(access);
+}
+
+static gboolean
+trout_transfer_access_intersects(GHashTable *first, GHashTable *second)
+{
+  GHashTableIter iterator;
+  gpointer key;
+  g_hash_table_iter_init(&iterator, first);
+  while (g_hash_table_iter_next(&iterator, &key, 0)) {
+    if (g_hash_table_contains(second, key)) return TRUE;
+  }
+  return FALSE;
+}
+
+gboolean
+trout_file_transfer_access_conflicts(trout_file_transfer_access *first, trout_file_transfer_access *second)
+{
+  if (first->exclusive || second->exclusive) return TRUE;
+  return trout_transfer_access_intersects(first->read_filesystems, second->write_filesystems) ||
+      trout_transfer_access_intersects(first->write_filesystems, second->read_filesystems) ||
+      trout_transfer_access_intersects(first->write_filesystems, second->write_filesystems);
 }
 
 trout_file_transfer_pair *

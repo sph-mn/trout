@@ -13,8 +13,7 @@ typedef enum {
 typedef enum {
   trout_file_collision_skip = 1,
   trout_file_collision_replace = 2,
-  trout_file_collision_cancel = 3,
-  trout_file_collision_merge = 4
+  trout_file_collision_cancel = 3
 } trout_file_collision_choice;
 
 typedef enum {
@@ -27,6 +26,13 @@ typedef enum {
 
 typedef struct trout_file_transfer_pair trout_file_transfer_pair;
 typedef struct trout_file_transfer_callbacks trout_file_transfer_callbacks;
+typedef struct trout_file_transfer_access trout_file_transfer_access;
+
+struct trout_file_transfer_access {
+  GHashTable *read_filesystems;
+  GHashTable *write_filesystems;
+  gboolean exclusive;
+};
 
 struct trout_file_transfer_callbacks {
   gpointer user_data;
@@ -42,6 +48,9 @@ trout_file_transfer_pair *trout_file_transfer_pair_new_rename(GFile *source, con
 GFile *trout_file_transfer_pair_get_source(trout_file_transfer_pair *pair);
 GFile *trout_file_transfer_pair_get_destination(trout_file_transfer_pair *pair);
 void trout_file_transfer_pair_destroy(gpointer user_data);
+trout_file_transfer_access *trout_file_transfer_access_new(GPtrArray *operations, trout_file_operation operation);
+void trout_file_transfer_access_destroy(trout_file_transfer_access *access);
+gboolean trout_file_transfer_access_conflicts(trout_file_transfer_access *first, trout_file_transfer_access *second);
 /* Failed and cancelled operations set error. Earlier committed entries are not rolled back. */
 trout_file_transfer_result trout_file_transfer_execute_full(GPtrArray *operations, trout_file_operation operation, GCancellable *cancellable, const trout_file_transfer_callbacks *callbacks, GError **error);
 /* Compatibility wrapper: TRUE only for a complete transfer. */

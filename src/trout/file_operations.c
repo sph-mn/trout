@@ -146,10 +146,9 @@ trout_tab_clipboard_read_destroy(trout_clipboard_read *read_data)
 }
 
 void
-trout_tab_paste(trout_tab *tab)
+trout_tab_paste(trout_tab *tab, GFile *destination)
 {
   char *mime_types[3];
-  GFile *destination;
   trout_clipboard_read *read_data;
   mime_types[0] = "x-special/gnome-copied-files";
   mime_types[1] = "text/uri-list";
@@ -157,7 +156,6 @@ trout_tab_paste(trout_tab *tab)
   read_data = g_new0(trout_clipboard_read, 1);
   read_data->window = tab->window;
   read_data->window_widget = g_object_ref(tab->window->window);
-  destination = tab->context_file_is_directory ? tab->context_file : tab->directory;
   read_data->destination = g_object_ref(destination);
   read_data->parent_widget = g_object_ref(tab->root);
   gdk_clipboard_read_async(tab->window->clipboard, (gpointer)mime_types, G_PRIORITY_DEFAULT, 0, trout_tab_clipboard_read_start, read_data);
@@ -632,8 +630,46 @@ trout_tab_properties_add_size(trout_properties_result *result, goffset size)
 }
 
 void
+trout_tab_properties_request_destroy(gpointer user_data)
+{
+  trout_properties_request *request;
+  request = user_data;
+  g_ptr_array_unref(request->files);
+  g_free(request);
+}
+
+static GPtrArray *
+trout_tab_properties_selection_files(trout_tab *tab, guint *selection_count)
+{
+  GtkBitset *selection;
+  GtkBitsetIter iterator;
+  GFileInfo *info;
+  GFile *file;
+  GPtrArray *files;
+  guint position;
+  files = g_ptr_array_new_with_free_func(g_object_unref);
+  selection = gtk_selection_model_get_selection(GTK_SELECTION_MODEL(tab->selection));
+  *selection_count = gtk_bitset_get_size(selection);
+  if (*selection_count == 0) {
+    file = tab->context_file_is_directory && tab->context_file != 0 ? tab->context_file : tab->directory;
+    g_ptr_array_add(files, g_object_ref(file));
+  } else if (gtk_bitset_iter_init_first(&iterator, selection, &position)) {
+    do {
+      info = g_list_model_get_item(G_LIST_MODEL(tab->sorted_list), position);
+      file = G_FILE(g_file_info_get_attribute_object(info, "standard::file"));
+      g_ptr_array_add(files, g_object_ref(file));
+      g_object_unref(info);
+    } while (gtk_bitset_iter_next(&iterator, &position));
+  }
+  gtk_bitset_unref(selection);
+  return files;
+}
+
+void
 trout_tab_properties_worker(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
 {
+  trout_properties_request *request;
+  guint file_index;
   GFile *file;
   GFileInfo *info;
   GFileEnumerator *enumerator;
@@ -645,73 +681,72 @@ trout_tab_properties_worker(GTask *task, gpointer source_object, gpointer task_d
   GPtrArray *frames;
   GFileType file_type;
   char *name;
-  file = task_data;
+  request = task_data;
   result = g_new0(trout_properties_result, 1);
-  error = 0;
-  info = g_file_query_info(file, "standard::type,standard::size", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error);
-  if (info == 0) {
-    result->incomplete = TRUE;
-    g_clear_error(&error);
-    g_task_return_pointer(task, result, g_free);
-    return;
-  }
-  file_type = g_file_info_get_file_type(info);
-  if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_SIZE)) trout_tab_properties_add_size(result, g_file_info_get_size(info));
-  else result->incomplete = TRUE;
-  g_object_unref(info);
   frames = g_ptr_array_new_with_free_func(trout_tab_properties_frame_destroy);
-  if (file_type == G_FILE_TYPE_DIRECTORY) {
+  for (file_index = 0; file_index < request->files->len && !g_cancellable_is_cancelled(cancellable); file_index += 1) {
+    file = g_ptr_array_index(request->files, file_index);
     error = 0;
-    enumerator = g_file_enumerate_children(file, "standard::name,standard::type,standard::size", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error);
-    if (enumerator == 0) {
+    info = g_file_query_info(file, "standard::type,standard::size", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error);
+    if (info == 0) {
       result->incomplete = TRUE;
       g_clear_error(&error);
-    } else {
-      frame = g_new(trout_properties_frame, 1);
-      frame->directory = g_object_ref(file);
-      frame->enumerator = enumerator;
-      g_ptr_array_add(frames, frame);
-    }
-  }
-  while (frames->len > 0 && (cancellable == 0 || !g_cancellable_is_cancelled(cancellable))) {
-    frame = g_ptr_array_index(frames, frames->len - 1);
-    error = 0;
-    info = g_file_enumerator_next_file(frame->enumerator, cancellable, &error);
-    if (error != 0) {
-      result->incomplete = TRUE;
-      g_clear_error(&error);
-      g_ptr_array_remove_index(frames, frames->len - 1);
-    } else if (info == 0) {
-      g_ptr_array_remove_index(frames, frames->len - 1);
     } else {
       file_type = g_file_info_get_file_type(info);
       if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_SIZE)) trout_tab_properties_add_size(result, g_file_info_get_size(info));
       else result->incomplete = TRUE;
       if (file_type == G_FILE_TYPE_DIRECTORY) {
-        name = (char *)g_file_info_get_name(info);
-        if (name == 0) {
+        error = 0;
+        enumerator = g_file_enumerate_children(file, "standard::name,standard::type,standard::size", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error);
+        if (enumerator == 0) {
           result->incomplete = TRUE;
+          g_clear_error(&error);
         } else {
-          child = g_file_get_child(frame->directory, name);
-          error = 0;
-          enumerator = g_file_enumerate_children(child, "standard::name,standard::type,standard::size", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error);
-          if (enumerator == 0) {
-            result->incomplete = TRUE;
-            g_clear_error(&error);
-          } else {
-            child_frame = g_new(trout_properties_frame, 1);
-            child_frame->directory = child;
-            child_frame->enumerator = enumerator;
-            g_ptr_array_add(frames, child_frame);
-            child = 0;
-          }
-          if (child != 0) g_object_unref(child);
+          frame = g_new(trout_properties_frame, 1);
+          frame->directory = g_object_ref(file);
+          frame->enumerator = enumerator;
+          g_ptr_array_add(frames, frame);
         }
       }
       g_object_unref(info);
     }
+    while (frames->len > 0 && !g_cancellable_is_cancelled(cancellable)) {
+      frame = g_ptr_array_index(frames, frames->len - 1);
+      error = 0;
+      info = g_file_enumerator_next_file(frame->enumerator, cancellable, &error);
+      if (error != 0) {
+        result->incomplete = TRUE;
+        g_clear_error(&error);
+        g_ptr_array_remove_index(frames, frames->len - 1);
+      } else if (info == 0) g_ptr_array_remove_index(frames, frames->len - 1);
+      else {
+        file_type = g_file_info_get_file_type(info);
+        if (g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_STANDARD_SIZE)) trout_tab_properties_add_size(result, g_file_info_get_size(info));
+        else result->incomplete = TRUE;
+        if (file_type == G_FILE_TYPE_DIRECTORY) {
+          name = (char *)g_file_info_get_name(info);
+          if (name == 0) result->incomplete = TRUE;
+          else {
+            child = g_file_get_child(frame->directory, name);
+            error = 0;
+            enumerator = g_file_enumerate_children(child, "standard::name,standard::type,standard::size", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, cancellable, &error);
+            if (enumerator == 0) {
+              result->incomplete = TRUE;
+              g_clear_error(&error);
+              g_object_unref(child);
+            } else {
+              child_frame = g_new(trout_properties_frame, 1);
+              child_frame->directory = child;
+              child_frame->enumerator = enumerator;
+              g_ptr_array_add(frames, child_frame);
+            }
+          }
+        }
+        g_object_unref(info);
+      }
+    }
   }
-  if (cancellable != 0 && g_cancellable_is_cancelled(cancellable)) result->incomplete = TRUE;
+  if (g_cancellable_is_cancelled(cancellable)) result->incomplete = TRUE;
   g_ptr_array_unref(frames);
   g_task_return_pointer(task, result, g_free);
   (void)source_object;
@@ -720,21 +755,30 @@ trout_tab_properties_worker(GTask *task, gpointer source_object, gpointer task_d
 void
 trout_tab_properties_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
 {
-  GtkWidget *dialog;
-  GtkWidget *label;
+  trout_tab *tab;
+  trout_properties_request *request;
   trout_properties_result *properties;
   GError *error;
+  char *summary;
   char *size_text;
+  char *status_text;
   char *text;
-  dialog = GTK_WIDGET(source_object);
+  request = g_task_get_task_data(G_TASK(result));
+  tab = g_object_get_data(G_OBJECT(source_object), "trout_tab");
   error = 0;
   properties = g_task_propagate_pointer(G_TASK(result), &error);
   if (error != 0) g_error_free(error);
-  if (properties != 0 && gtk_widget_get_visible(dialog)) {
-    label = g_object_get_data(G_OBJECT(dialog), "trout_properties_size_label");
+  if (tab != 0 && properties != 0 && request->generation == tab->properties_generation && gtk_widget_get_root(tab->root) != 0) {
+    g_clear_object(&tab->properties_cancellable);
     size_text = trout_format_size(properties->size, properties->incomplete);
-    text = g_strdup_printf("Size: %s", size_text);
-    gtk_label_set_text(GTK_LABEL(label), text);
+    if (request->selection_count == 0) text = g_strdup_printf("Directory size: %s", size_text);
+    else if (request->selection_count == 1) text = g_strdup_printf("Selected size: %s", size_text);
+    else text = g_strdup_printf("Size of %u selected items: %s", request->selection_count, size_text);
+    summary = trout_tab_status_summary(tab);
+    status_text = g_strdup_printf("%s    %s", summary, text);
+    gtk_label_set_text(GTK_LABEL(tab->status_label), status_text);
+    g_free(status_text);
+    g_free(summary);
     g_free(size_text);
     g_free(text);
   }
@@ -742,67 +786,38 @@ trout_tab_properties_done(GObject *source_object, GAsyncResult *result, gpointer
   (void)user_data;
 }
 
-gboolean
-trout_tab_properties_close_request(GtkWindow *window, gpointer user_data)
-{
-  GCancellable *cancellable;
-  cancellable = g_object_get_data(G_OBJECT(window), "trout_properties_cancellable");
-  if (cancellable != 0) g_cancellable_cancel(cancellable);
-  (void)user_data;
-  return FALSE;
-}
-
-void
-trout_tab_properties_close(GtkButton *button, gpointer user_data)
-{
-  gtk_window_close(GTK_WINDOW(user_data));
-  (void)button;
-}
-
 void
 trout_tab_show_properties(trout_tab *tab)
 {
-  GtkWidget *dialog;
-  GtkWidget *content;
-  GtkWidget *label;
-  GtkWidget *buttons;
-  GtkWidget *close_button;
-  GtkRoot *parent;
+  trout_properties_request *request;
   GCancellable *cancellable;
   GTask *task;
-  dialog = gtk_window_new();
-  gtk_window_set_title(GTK_WINDOW(dialog), "Properties");
-  gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
-  gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
-  parent = gtk_widget_get_root(tab->root);
-  if (parent != 0 && GTK_IS_WINDOW(parent)) {
-    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(parent));
-    gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
+  char *summary;
+  char *status_text;
+  char *text;
+  if (tab->properties_cancellable != 0) {
+    g_cancellable_cancel(tab->properties_cancellable);
+    g_clear_object(&tab->properties_cancellable);
   }
-  content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-  gtk_widget_set_margin_start(content, 16);
-  gtk_widget_set_margin_end(content, 16);
-  gtk_widget_set_margin_top(content, 16);
-  gtk_widget_set_margin_bottom(content, 16);
-  label = gtk_label_new("Calculating…");
-  gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
-  g_object_set_data(G_OBJECT(dialog), "trout_properties_size_label", label);
-  gtk_box_append(GTK_BOX(content), label);
-  buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-  gtk_widget_set_halign(buttons, GTK_ALIGN_END);
-  close_button = gtk_button_new_with_label("Close");
-  g_signal_connect(close_button, "clicked", G_CALLBACK(trout_tab_properties_close), dialog);
-  gtk_box_append(GTK_BOX(buttons), close_button);
-  gtk_box_append(GTK_BOX(content), buttons);
-  gtk_window_set_child(GTK_WINDOW(dialog), content);
-  g_signal_connect(dialog, "close-request", G_CALLBACK(trout_tab_properties_close_request), 0);
+  request = g_new(trout_properties_request, 1);
+  request->files = trout_tab_properties_selection_files(tab, &request->selection_count);
+  request->generation = tab->properties_generation + 1;
+  tab->properties_generation = request->generation;
   cancellable = g_cancellable_new();
-  g_object_set_data_full(G_OBJECT(dialog), "trout_properties_cancellable", cancellable, g_object_unref);
-  task = g_task_new(G_OBJECT(dialog), cancellable, trout_tab_properties_done, 0);
-  g_task_set_task_data(task, g_object_ref(tab->context_file), g_object_unref);
+  tab->properties_cancellable = g_object_ref(cancellable);
+  if (request->selection_count == 0) text = g_strdup("Calculating directory size…");
+  else text = g_strdup_printf("Calculating size of %u selected items…", request->selection_count);
+  summary = trout_tab_status_summary(tab);
+  status_text = g_strdup_printf("%s    %s", summary, text);
+  gtk_label_set_text(GTK_LABEL(tab->status_label), status_text);
+  g_free(status_text);
+  g_free(summary);
+  g_free(text);
+  task = g_task_new(G_OBJECT(tab->root), cancellable, trout_tab_properties_done, 0);
+  g_task_set_task_data(task, request, trout_tab_properties_request_destroy);
   g_task_run_in_thread(task, trout_tab_properties_worker);
   g_object_unref(task);
-  gtk_window_present(GTK_WINDOW(dialog));
+  g_object_unref(cancellable);
 }
 
 void
@@ -866,7 +881,7 @@ trout_tab_context_action(GtkButton *button, gpointer user_data)
   popover = g_object_get_data(G_OBJECT(button), "trout_context_popover");
   if (g_strcmp0(action_name, "copy") == 0) trout_tab_copy_selection(tab, FALSE);
   else if (g_strcmp0(action_name, "cut") == 0) trout_tab_copy_selection(tab, TRUE);
-  else if (g_strcmp0(action_name, "paste") == 0) trout_tab_paste(tab);
+  else if (g_strcmp0(action_name, "paste") == 0) trout_tab_paste(tab, tab->context_file_is_directory ? tab->context_file : tab->directory);
   else if (g_strcmp0(action_name, "rename") == 0) trout_tab_rename_context_file(tab);
   else if (g_strcmp0(action_name, "delete") == 0) trout_tab_delete_selection(tab);
   else if (g_strcmp0(action_name, "properties") == 0) trout_tab_show_properties(tab);

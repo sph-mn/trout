@@ -177,6 +177,147 @@ exit:
   return status;
 }
 
+static trout_file_transfer_access *
+trout_test_transfer_access_create(const char *read_filesystem, const char *write_filesystem, gboolean exclusive)
+{
+  trout_file_transfer_access *access;
+  access = g_new0(trout_file_transfer_access, 1);
+  access->read_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
+  access->write_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
+  access->exclusive = exclusive;
+  if (read_filesystem != 0) g_hash_table_add(access->read_filesystems, g_strdup(read_filesystem));
+  if (write_filesystem != 0) g_hash_table_add(access->write_filesystems, g_strdup(write_filesystem));
+  return access;
+}
+
+static gboolean
+trout_test_filesystem_set_equal(GHashTable *first, GHashTable *second)
+{
+  GHashTableIter iterator;
+  gpointer key;
+  if (g_hash_table_size(first) != g_hash_table_size(second)) return FALSE;
+  g_hash_table_iter_init(&iterator, first);
+  while (g_hash_table_iter_next(&iterator, &key, 0)) {
+    if (!g_hash_table_contains(second, key)) return FALSE;
+  }
+  return TRUE;
+}
+
+static char *
+trout_test_file_transfer_filesystem_key(const char *path)
+{
+  GFile *file;
+  GFileInfo *info;
+  const char *filesystem;
+  char *key;
+  file = g_file_new_for_path(path);
+  info = g_file_query_info(file, "unix::device,id::filesystem", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, 0, 0);
+  key = 0;
+  if (info != 0 && g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_DEVICE))
+    key = g_strdup_printf("unix:%" G_GUINT32_FORMAT, g_file_info_get_attribute_uint32(info, G_FILE_ATTRIBUTE_UNIX_DEVICE));
+  else if (info != 0 && (filesystem = g_file_info_get_attribute_string(info, G_FILE_ATTRIBUTE_ID_FILESYSTEM)) != 0)
+    key = g_strdup_printf("gio:%s", filesystem);
+  g_clear_object(&info);
+  g_object_unref(file);
+  return key;
+}
+
+trout_test_status_t
+trout_test_transfer_access_conflicts(void)
+{
+  trout_test_status_t status = {0};
+  trout_file_transfer_access *first_read;
+  trout_file_transfer_access *second_read;
+  trout_file_transfer_access *same_write;
+  trout_file_transfer_access *different_write;
+  trout_file_transfer_access *unknown;
+  status.group = "";
+  first_read = trout_test_transfer_access_create("filesystem-a", 0, FALSE);
+  second_read = trout_test_transfer_access_create("filesystem-a", 0, FALSE);
+  same_write = trout_test_transfer_access_create(0, "filesystem-a", FALSE);
+  different_write = trout_test_transfer_access_create(0, "filesystem-b", FALSE);
+  unknown = trout_test_transfer_access_create(0, 0, TRUE);
+  test_helper_assert("concurrent reads do not conflict", !trout_file_transfer_access_conflicts(first_read, second_read));
+  test_helper_assert("read blocks a write", trout_file_transfer_access_conflicts(first_read, same_write));
+  test_helper_assert("write blocks a read", trout_file_transfer_access_conflicts(same_write, first_read));
+  test_helper_assert("writes to one filesystem conflict", trout_file_transfer_access_conflicts(same_write, same_write));
+  test_helper_assert("different filesystems do not conflict", !trout_file_transfer_access_conflicts(first_read, different_write));
+  test_helper_assert("unknown filesystem access conflicts exclusively", trout_file_transfer_access_conflicts(unknown, different_write));
+exit:
+  trout_file_transfer_access_destroy(first_read);
+  trout_file_transfer_access_destroy(second_read);
+  trout_file_transfer_access_destroy(same_write);
+  trout_file_transfer_access_destroy(different_write);
+  trout_file_transfer_access_destroy(unknown);
+  return status;
+}
+
+trout_test_status_t
+trout_test_transfer_access_profiles(void)
+{
+  trout_test_status_t status = {0};
+  char *directory;
+  char *source_path;
+  char *destination_path;
+  GFile *root_file;
+  GFile *source_file;
+  GFile *destination_file;
+  trout_file_transfer_pair *pair;
+  GPtrArray *operations;
+  trout_file_transfer_access *copy_access;
+  trout_file_transfer_access *move_access;
+  trout_file_transfer_access *delete_access;
+  GError *error;
+  status.group = "";
+  directory = 0;
+  source_path = 0;
+  destination_path = 0;
+  root_file = 0;
+  source_file = 0;
+  destination_file = 0;
+  pair = 0;
+  operations = 0;
+  copy_access = 0;
+  move_access = 0;
+  delete_access = 0;
+  error = 0;
+  directory = g_dir_make_tmp("trout-access-test-XXXXXX", &error);
+  test_helper_assert("temporary directory created", directory != 0);
+  source_path = g_build_filename(directory, "source", (char *)0);
+  destination_path = g_build_filename(directory, "destination", (char *)0);
+  test_helper_assert("source file created", g_file_set_contents(source_path, "content", -1, &error));
+  source_file = g_file_new_for_path(source_path);
+  destination_file = g_file_new_for_path(destination_path);
+  operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
+  pair = trout_file_transfer_pair_new(source_file, destination_file);
+  g_ptr_array_add(operations, pair);
+  copy_access = trout_file_transfer_access_new(operations, trout_file_operation_copy);
+  move_access = trout_file_transfer_access_new(operations, trout_file_operation_move);
+  delete_access = trout_file_transfer_access_new(operations, trout_file_operation_delete);
+  test_helper_assert("copy and move have the same access profile", trout_test_filesystem_set_equal(copy_access->read_filesystems, move_access->read_filesystems) && trout_test_filesystem_set_equal(copy_access->write_filesystems, move_access->write_filesystems));
+  test_helper_assert("filesystem lookup leaves a reservation or marks access exclusive", copy_access->exclusive || g_hash_table_size(copy_access->write_filesystems) > 0);
+  test_helper_assert("delete has no read reservation", g_hash_table_size(delete_access->read_filesystems) == 0);
+  test_helper_assert("same-filesystem delete conflicts with transfer", trout_file_transfer_access_conflicts(copy_access, delete_access));
+exit:
+  g_clear_error(&error);
+  if (directory != 0) {
+    root_file = g_file_new_for_path(directory);
+    trout_test_delete_tree(root_file, &error);
+    g_clear_error(&error);
+  }
+  g_clear_object(&root_file);
+  g_clear_object(&source_file);
+  g_clear_object(&destination_file);
+  if (operations != 0) g_ptr_array_unref(operations);
+  g_clear_pointer(&copy_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&move_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&delete_access, trout_file_transfer_access_destroy);
+  g_free(directory);
+  g_free(source_path);
+  g_free(destination_path);
+  return status;
+}
+
 trout_test_status_t
 trout_test_file_delete_tree(void)
 {
@@ -257,7 +398,6 @@ typedef struct {
   guint collision_count;
   guint directory_collision_count;
   guint file_collision_count;
-  gboolean merge_directories;
   gboolean replace_destination_on_collision;
   gboolean callback_ok;
 } trout_test_file_transfer_response;
@@ -295,7 +435,6 @@ trout_test_file_transfer_collision(GFile *source, GFile *destination, GFile *sou
   (void)destination_root;
   (void)source_size;
   (void)destination_size;
-  if (response->merge_directories && trout_file_transfer_should_merge(source_type, destination_type)) return trout_file_collision_merge;
   return response->choice;
 }
 
@@ -418,12 +557,11 @@ trout_test_file_transfer_merges_directories(void)
   operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
   trout_test_file_transfer_add(operations, source_directory, destination_directory);
   cancellable = g_cancellable_new();
-  response.merge_directories = TRUE;
   response.choice = trout_file_collision_skip;
   result = trout_test_file_transfer_run_full(operations, trout_file_operation_copy, cancellable, &response, &error);
   test_helper_assert("directory merge reports a partial result after a skipped file", result == trout_file_transfer_partial && error == 0);
-  test_helper_assert("directory and file collisions were reported", response.collision_count == 3);
-  test_helper_assert("root and nested directories merged", response.directory_collision_count == 2);
+  test_helper_assert("only the conflicting file requires a choice", response.collision_count == 1);
+  test_helper_assert("directory collisions do not request a choice", response.directory_collision_count == 0);
   test_helper_assert("file collision was reported", response.file_collision_count == 1);
   test_helper_assert("new file copied", g_file_get_contents(destination_new_file, &contents, 0, &error));
   test_helper_assert("new file contents match", g_strcmp0(contents, "new") == 0);
@@ -718,12 +856,11 @@ trout_test_file_transfer_move_collisions(void)
   response.collision_count = 0;
   response.directory_collision_count = 0;
   response.file_collision_count = 0;
-  response.merge_directories = TRUE;
   response.choice = trout_file_collision_skip;
   test_helper_assert("directory move with skipped conflicts is partial", trout_test_file_transfer_run_full(operations, trout_file_operation_move, cancellable, &response, &error) == trout_file_transfer_partial);
   test_helper_assert("partial directory move has no error", error == 0);
-  test_helper_assert("directory and file collisions were reported", response.collision_count == 4);
-  test_helper_assert("root and nested directories merged", response.directory_collision_count == 2);
+  test_helper_assert("only conflicting files require a choice", response.collision_count == 2);
+  test_helper_assert("directory collisions do not request a choice", response.directory_collision_count == 0);
   test_helper_assert("conflicting files were reported", response.file_collision_count == 2);
   test_helper_assert("skipped source directory remains", g_file_test(source_directory, G_FILE_TEST_IS_DIR));
   test_helper_assert("skipped destination directory remains", g_file_test(destination_directory, G_FILE_TEST_IS_DIR));
@@ -740,9 +877,12 @@ trout_test_file_transfer_move_collisions(void)
   test_helper_assert("nested moved contents match", g_strcmp0(contents, "added nested") == 0);
   g_clear_pointer(&contents, g_free);
   response.collision_count = 0;
+  response.directory_collision_count = 0;
+  response.file_collision_count = 0;
   response.choice = trout_file_collision_replace;
   test_helper_assert("directory move replaces conflicting files", trout_test_file_transfer_run_full(operations, trout_file_operation_move, cancellable, &response, &error) == trout_file_transfer_complete);
-  test_helper_assert("directory and file replacements were reported", response.collision_count == 4);
+  test_helper_assert("only conflicting files require replacement", response.collision_count == 2);
+  test_helper_assert("directory collisions do not request replacement", response.directory_collision_count == 0);
   test_helper_assert("directory move source is removed when empty", !g_file_test(source_directory, G_FILE_TEST_EXISTS));
   test_helper_assert("directory move destination remains", g_file_test(destination_directory, G_FILE_TEST_IS_DIR));
   test_helper_assert("directory move installs the source file", g_file_get_contents(destination_directory_file, &contents, 0, &error));
@@ -1107,6 +1247,8 @@ trout_test_file_transfer_cross_device_move(void)
   char *destination_empty;
   char *destination_link;
   char *contents;
+  char *source_filesystem;
+  char *destination_filesystem;
   struct stat source_stat;
   struct stat destination_stat;
   GFile *root_file;
@@ -1114,6 +1256,8 @@ trout_test_file_transfer_cross_device_move(void)
   GFile *link_file;
   GPtrArray *operations;
   GCancellable *cancellable;
+  trout_file_transfer_access *copy_access;
+  trout_file_transfer_access *move_access;
   GError *error;
   trout_file_transfer_result result;
   status.group = "";
@@ -1131,11 +1275,15 @@ trout_test_file_transfer_cross_device_move(void)
   destination_empty = 0;
   destination_link = 0;
   contents = 0;
+  source_filesystem = 0;
+  destination_filesystem = 0;
   root_file = 0;
   peer_root_file = 0;
   link_file = 0;
   operations = 0;
   cancellable = 0;
+  copy_access = 0;
+  move_access = 0;
   error = 0;
   if (!g_file_test("/dev/shm", G_FILE_TEST_IS_DIR)) {
     printf("cross-filesystem move skipped: /dev/shm is unavailable\n");
@@ -1176,6 +1324,16 @@ trout_test_file_transfer_cross_device_move(void)
   g_clear_error(&error);
   operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
   trout_test_file_transfer_add(operations, source_directory, destination_directory);
+  copy_access = trout_file_transfer_access_new(operations, trout_file_operation_copy);
+  move_access = trout_file_transfer_access_new(operations, trout_file_operation_move);
+  source_filesystem = trout_test_file_transfer_filesystem_key(source_parent);
+  destination_filesystem = trout_test_file_transfer_filesystem_key(destination_parent);
+  test_helper_assert("source and destination filesystems differ", source_filesystem != 0 && destination_filesystem != 0 && g_strcmp0(source_filesystem, destination_filesystem) != 0);
+  test_helper_assert("move reads the source filesystem", g_hash_table_contains(move_access->read_filesystems, source_filesystem));
+  test_helper_assert("move does not write the source filesystem", !g_hash_table_contains(move_access->write_filesystems, source_filesystem));
+  test_helper_assert("move writes the destination filesystem", g_hash_table_contains(move_access->write_filesystems, destination_filesystem));
+  test_helper_assert("move does not read the destination filesystem", !g_hash_table_contains(move_access->read_filesystems, destination_filesystem));
+  test_helper_assert("copy and move have the same access profile", trout_test_filesystem_set_equal(copy_access->read_filesystems, move_access->read_filesystems) && trout_test_filesystem_set_equal(copy_access->write_filesystems, move_access->write_filesystems));
   cancellable = g_cancellable_new();
   result = trout_test_file_transfer_run_full(operations, trout_file_operation_move, cancellable, &response, &error);
   test_helper_assert("cross-filesystem directory move completes", result == trout_file_transfer_complete && error == 0);
@@ -1200,6 +1358,10 @@ exit:
   g_clear_object(&root_file);
   g_clear_object(&peer_root_file);
   g_clear_object(&link_file);
+  g_clear_pointer(&copy_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&move_access, trout_file_transfer_access_destroy);
+  g_free(source_filesystem);
+  g_free(destination_filesystem);
   g_clear_object(&cancellable);
   if (operations != 0) g_ptr_array_unref(operations);
   g_free(directory);
@@ -1307,6 +1469,8 @@ main(void)
   test_helper_test(trout_test_action_file_types);
   test_helper_test(trout_test_transfer_destination_guard);
   test_helper_test(trout_test_transfer_merge_policy);
+  test_helper_test(trout_test_transfer_access_conflicts);
+  test_helper_test(trout_test_transfer_access_profiles);
   test_helper_test(trout_test_file_delete_tree);
   test_helper_test(trout_test_file_transfer_merges_directories);
   test_helper_test(trout_test_file_transfer_replace_and_cancel);
