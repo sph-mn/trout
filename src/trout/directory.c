@@ -271,7 +271,7 @@ trout_tab_on_directory_items_changed(GListModel *model, guint position, guint re
 void
 trout_tab_schedule_directory_refresh(trout_tab *tab)
 {
-  if (tab->directory_refresh_source_id == 0) {
+  if (!tab->directory_refresh_immediate && tab->directory_refresh_source_id == 0) {
     tab->directory_refresh_source_id = g_timeout_add(trout_directory_refresh_interval_milliseconds,
         trout_tab_refresh_directory_timeout, tab);
   }
@@ -286,6 +286,7 @@ trout_tab_discard_directory_snapshot(trout_tab *tab)
   }
   tab->directory_dirty = FALSE;
   tab->directory_initialized = FALSE;
+  tab->directory_refresh_immediate = FALSE;
   tab->directory_has_thumbnailable_file = FALSE;
   tab->directory_scroll_pending = FALSE;
   g_list_store_remove_all(tab->display_list);
@@ -335,6 +336,7 @@ trout_tab_refresh_directory_snapshot(trout_tab *tab)
   gboolean has_thumbnailable_file;
   gboolean scan_all_subdirectories;
   tab->directory_dirty = FALSE;
+  tab->directory_refresh_immediate = FALSE;
   tab->directory_initialized = TRUE;
   snapshot = g_ptr_array_new_with_free_func(g_object_unref);
   item_count = g_list_model_get_n_items(G_LIST_MODEL(tab->directory_list));
@@ -401,6 +403,23 @@ trout_tab_refresh_directory_snapshot(trout_tab *tab)
   g_ptr_array_unref(snapshot);
   trout_tab_restore_directory_scroll(tab);
   trout_tab_restore_directory_selection(tab);
+}
+
+void
+trout_tab_refresh_directory_now(trout_tab *tab)
+{
+  if (tab->directory_refresh_source_id != 0) {
+    g_source_remove(tab->directory_refresh_source_id);
+    tab->directory_refresh_source_id = 0;
+  }
+  if (tab->directory_dirty) {
+    if (gtk_directory_list_is_loading(tab->directory_list)) {
+      tab->directory_refresh_immediate = TRUE;
+    } else {
+      tab->directory_refresh_immediate = FALSE;
+      trout_tab_refresh_directory_snapshot(tab);
+    }
+  }
 }
 
 gboolean
@@ -486,6 +505,9 @@ trout_tab_on_directory_loading_changed(GtkDirectoryList *directory_list, GParamS
         tab->directory_refresh_source_id = 0;
       }
       trout_tab_refresh_directory_snapshot(tab);
+    } else if (tab->directory_refresh_immediate) {
+      tab->directory_refresh_immediate = FALSE;
+      if (tab->directory_dirty) trout_tab_refresh_directory_snapshot(tab);
     } else if (tab->directory_dirty) trout_tab_schedule_directory_refresh(tab);
   }
   (void)directory_list;

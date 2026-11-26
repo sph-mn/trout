@@ -139,6 +139,7 @@ struct trout_tab {
   double directory_scroll_horizontal;
   double directory_scroll_vertical;
   guint directory_refresh_source_id;
+  gboolean directory_refresh_immediate;
   guint directory_generation;
   guint free_space_query_generation;
   guint properties_generation;
@@ -212,6 +213,7 @@ struct trout_transfer_request {
   char *summary;
   gboolean paused;
   gboolean preparing;
+  gboolean access_stale;
   gboolean queued;
   gboolean active;
   gboolean removed;
@@ -292,6 +294,11 @@ struct trout_free_space_query {
   guint query_generation;
 };
 
+struct trout_action_process {
+  GWeakRef root;
+  guint directory_generation;
+};
+
 void trout_tab_update_location(trout_tab *tab);
 void trout_tab_update_status(trout_tab *tab);
 void trout_tab_update_free_space(trout_tab *tab);
@@ -328,6 +335,7 @@ void trout_tab_set_sort_order(trout_tab *tab, guint sort_order);
 void trout_tab_save_directory_selection(trout_tab *tab);
 void trout_tab_restore_directory_selection(trout_tab *tab);
 void trout_tab_schedule_directory_refresh(trout_tab *tab);
+void trout_tab_refresh_directory_now(trout_tab *tab);
 gboolean trout_tab_refresh_directory_timeout(gpointer user_data);
 void trout_window_add_tab(trout_window *window, GFile *directory);
 GtkWidget *trout_window_create(GtkApplication *application, GFile *directory);
@@ -876,7 +884,11 @@ trout_action_activate(GtkButton *button, gpointer user_data)
       if (spawn_status != 0) {
         trout_tab_show_message(tab->root, g_strerror(spawn_status));
       } else {
-        g_child_watch_add(process_id, trout_action_child_exited, 0);
+        struct trout_action_process *process;
+        process = g_new(struct trout_action_process, 1);
+        g_weak_ref_init(&process->root, G_OBJECT(tab->root));
+        process->directory_generation = tab->directory_generation;
+        g_child_watch_add(process_id, trout_action_child_exited, process);
       }
     }
     g_free(working_directory);
@@ -889,9 +901,22 @@ trout_action_activate(GtkButton *button, gpointer user_data)
 void
 trout_action_child_exited(GPid process_id, gint wait_status, gpointer user_data)
 {
+  struct trout_action_process *process;
+  GtkWidget *root;
+  trout_tab *tab;
+  process = user_data;
+  root = g_weak_ref_get(&process->root);
+  if (root != 0) {
+    tab = g_object_get_data(G_OBJECT(root), "trout_tab");
+    if (tab != 0 && gtk_widget_get_root(root) != 0 && tab->directory_generation == process->directory_generation) {
+      trout_tab_refresh_directory_now(tab);
+    }
+    g_object_unref(root);
+  }
+  g_weak_ref_clear(&process->root);
+  g_free(process);
   g_spawn_close_pid(process_id);
   (void)wait_status;
-  (void)user_data;
 }
 
 #include "directory.c"

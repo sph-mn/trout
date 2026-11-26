@@ -25,6 +25,12 @@ struct trout_transfer_access_node {
   GFileInfo *info;
 };
 
+typedef struct trout_transfer_path_claim trout_transfer_path_claim;
+struct trout_transfer_path_claim {
+  char *path;
+  gboolean recursive;
+};
+
 typedef struct trout_transfer_node trout_transfer_node;
 struct trout_transfer_node {
   GFile *source;
@@ -818,6 +824,123 @@ trout_transfer_filesystem_query(GFile *file)
   return info;
 }
 
+static void
+trout_transfer_path_claim_destroy(gpointer user_data)
+{
+  trout_transfer_path_claim *claim;
+  claim = user_data;
+  g_free(claim->path);
+  g_free(claim);
+}
+
+static gboolean
+trout_transfer_path_parents_are_plain(trout_file_transfer_access *access, GFile *file)
+{
+  GFile *ancestor;
+  GFile *parent;
+  GFileInfo *info;
+  gboolean is_plain;
+  ancestor = g_file_get_parent(file);
+  while (ancestor != 0) {
+    info = g_file_query_info(ancestor, "standard::type,unix::is-mountpoint", G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, 0, 0);
+    parent = g_file_get_parent(ancestor);
+    is_plain = info != 0 && g_file_info_get_file_type(info) != G_FILE_TYPE_SYMBOLIC_LINK &&
+        g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_IS_MOUNTPOINT);
+    if (!is_plain) access->exclusive = TRUE;
+    else if (g_file_info_get_attribute_boolean(info, G_FILE_ATTRIBUTE_UNIX_IS_MOUNTPOINT) && parent != 0) is_plain = FALSE;
+    g_clear_object(&info);
+    g_object_unref(ancestor);
+    if (!is_plain) {
+      g_clear_object(&parent);
+      return FALSE;
+    }
+    ancestor = parent;
+  }
+  return TRUE;
+}
+
+static char *
+trout_transfer_access_path(trout_file_transfer_access *access, GFile *file, GFileInfo *info, gboolean require_existing)
+{
+  GFile *parent;
+  char *path;
+  char *parent_path;
+  char *canonical_parent;
+  char *basename;
+  char *result;
+  path = g_file_get_path(file);
+  if (path == 0) {
+    access->paths_complete = FALSE;
+    return 0;
+  }
+  if (info == 0 && require_existing) {
+    access->paths_complete = FALSE;
+    access->exclusive = TRUE;
+  }
+  if (info != 0 && !g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_UNIX_IS_MOUNTPOINT)) {
+    access->paths_complete = FALSE;
+    access->exclusive = TRUE;
+  } else if (info != 0 && g_file_info_get_attribute_boolean(info, G_FILE_ATTRIBUTE_UNIX_IS_MOUNTPOINT)) access->paths_complete = FALSE;
+  if (!trout_transfer_path_parents_are_plain(access, file)) access->paths_complete = FALSE;
+  parent = g_file_get_parent(file);
+  if (parent == 0) {
+    access->paths_complete = FALSE;
+    access->exclusive = TRUE;
+    result = g_canonicalize_filename(path, 0);
+    g_free(path);
+    return result;
+  }
+  parent_path = g_file_get_path(parent);
+  canonical_parent = parent_path != 0 ? realpath(parent_path, 0) : 0;
+  if (canonical_parent == 0) {
+    access->paths_complete = FALSE;
+    access->exclusive = TRUE;
+    result = g_canonicalize_filename(path, 0);
+  } else {
+    basename = g_path_get_basename(path);
+    result = g_build_filename(canonical_parent, basename, (char *)0);
+    g_free(basename);
+    free(canonical_parent);
+  }
+  g_free(parent_path);
+  g_object_unref(parent);
+  g_free(path);
+  return result;
+}
+
+static void
+trout_transfer_access_add_path(trout_file_transfer_access *access, GPtrArray *paths, GFile *file,
+    GFileInfo *info, gboolean recursive, gboolean require_existing)
+{
+  trout_transfer_path_claim *claim;
+  char *path;
+  path = trout_transfer_access_path(access, file, info, require_existing);
+  if (path != 0) {
+    claim = g_new(trout_transfer_path_claim, 1);
+    claim->path = path;
+    claim->recursive = recursive;
+    g_ptr_array_add(paths, claim);
+  }
+}
+
+static void
+trout_transfer_access_add_staging_directory(trout_file_transfer_access *access, GFile *destination)
+{
+  GFile *parent;
+  GFileInfo *info;
+  char *path;
+  parent = g_file_get_parent(destination);
+  if (parent == 0) {
+    access->paths_complete = FALSE;
+    return;
+  }
+  info = trout_transfer_filesystem_query(parent);
+  path = trout_transfer_access_path(access, parent, info, TRUE);
+  if (path != 0) g_ptr_array_add(access->staging_directories, path);
+  g_clear_object(&info);
+  g_object_unref(parent);
+}
+
 static char *
 trout_transfer_parent_filesystem_key(GFile *file)
 {
@@ -864,6 +987,7 @@ trout_transfer_access_add_tree(trout_file_transfer_access *access, GFile *file, 
   info = root_info != 0 ? g_object_ref(root_info) : trout_transfer_filesystem_query(file);
   if (info == 0) {
     access->exclusive = TRUE;
+    access->paths_complete = FALSE;
     return;
   }
   node = g_new(trout_transfer_access_node, 1);
@@ -874,10 +998,15 @@ trout_transfer_access_add_tree(trout_file_transfer_access *access, GFile *file, 
     key = trout_transfer_filesystem_key(node->info);
     trout_transfer_access_add(filesystems, key, access);
     if (g_file_info_get_file_type(node->info) == G_FILE_TYPE_DIRECTORY) {
+      if (!g_file_info_has_attribute(node->info, G_FILE_ATTRIBUTE_UNIX_IS_MOUNTPOINT)) {
+        access->paths_complete = FALSE;
+        access->exclusive = TRUE;
+      } else if (g_file_info_get_attribute_boolean(node->info, G_FILE_ATTRIBUTE_UNIX_IS_MOUNTPOINT)) access->paths_complete = FALSE;
       error = 0;
       enumerator = g_file_enumerate_children(node->file, trout_transfer_attributes, G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, 0, &error);
       if (enumerator == 0) {
         access->exclusive = TRUE;
+        access->paths_complete = FALSE;
         g_clear_error(&error);
       } else {
         while ((info = g_file_enumerator_next_file(enumerator, 0, &error)) != 0) {
@@ -894,9 +1023,15 @@ trout_transfer_access_add_tree(trout_file_transfer_access *access, GFile *file, 
             g_object_unref(info);
           }
         }
-        if (error != 0) access->exclusive = TRUE;
+        if (error != 0) {
+          access->exclusive = TRUE;
+          access->paths_complete = FALSE;
+        }
         g_clear_error(&error);
-        if (!g_file_enumerator_close(enumerator, 0, &error)) access->exclusive = TRUE;
+        if (!g_file_enumerator_close(enumerator, 0, &error)) {
+          access->exclusive = TRUE;
+          access->paths_complete = FALSE;
+        }
         g_clear_error(&error);
         g_object_unref(enumerator);
       }
@@ -923,23 +1058,48 @@ trout_file_transfer_access_new(GPtrArray *operations, trout_file_operation opera
   access = g_new0(trout_file_transfer_access, 1);
   access->read_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
   access->write_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
+  access->read_paths = g_ptr_array_new_with_free_func(trout_transfer_path_claim_destroy);
+  access->write_paths = g_ptr_array_new_with_free_func(trout_transfer_path_claim_destroy);
+  access->rename_paths = g_ptr_array_new_with_free_func(trout_transfer_path_claim_destroy);
+  access->staging_directories = g_ptr_array_new_with_free_func(g_free);
+  access->operation = operation;
+  access->paths_complete = TRUE;
   for (index = 0; index < operations->len; index += 1) {
     pair = g_ptr_array_index(operations, index);
     if (operation == trout_file_operation_delete) {
+      source_info = trout_transfer_filesystem_query(pair->source);
       trout_transfer_access_add_tree(access, pair->source, access->write_filesystems, 0);
+      source_type = source_info != 0 ? g_file_info_get_file_type(source_info) : G_FILE_TYPE_UNKNOWN;
+      trout_transfer_access_add_path(access, access->write_paths, pair->source, source_info,
+          source_type == G_FILE_TYPE_DIRECTORY, TRUE);
+      g_clear_object(&source_info);
       continue;
     }
     if (operation == trout_file_operation_rename) {
+      source_info = trout_transfer_filesystem_query(pair->source);
+      destination_info = trout_transfer_filesystem_query(pair->destination);
       destination_key = trout_transfer_parent_filesystem_key(pair->source);
       trout_transfer_access_add(access->write_filesystems, destination_key, access);
       destination_key = trout_transfer_parent_filesystem_key(pair->destination);
       trout_transfer_access_add(access->write_filesystems, destination_key, access);
+      source_type = source_info != 0 ? g_file_info_get_file_type(source_info) : G_FILE_TYPE_UNKNOWN;
+      trout_transfer_access_add_path(access, access->rename_paths, pair->source, source_info,
+          source_type == G_FILE_TYPE_DIRECTORY, TRUE);
+      trout_transfer_access_add_path(access, access->rename_paths, pair->destination, destination_info,
+          source_type == G_FILE_TYPE_DIRECTORY, FALSE);
+      g_clear_object(&source_info);
+      g_clear_object(&destination_info);
       continue;
     }
     source_info = trout_transfer_filesystem_query(pair->source);
     source_type = source_info != 0 ? g_file_info_get_file_type(source_info) : G_FILE_TYPE_UNKNOWN;
     destination_info = trout_transfer_filesystem_query(pair->destination);
     destination_type = destination_info != 0 ? g_file_info_get_file_type(destination_info) : G_FILE_TYPE_UNKNOWN;
+    trout_transfer_access_add_path(access, access->read_paths, pair->source, source_info,
+        source_type == G_FILE_TYPE_DIRECTORY, TRUE);
+    trout_transfer_access_add_path(access, access->write_paths, pair->destination, destination_info,
+        source_type == G_FILE_TYPE_DIRECTORY || destination_type == G_FILE_TYPE_DIRECTORY, FALSE);
+    if (source_type != G_FILE_TYPE_DIRECTORY) trout_transfer_access_add_staging_directory(access, pair->destination);
     trout_transfer_access_add_tree(access, pair->source, access->read_filesystems, source_info);
     if (trout_file_transfer_should_merge(source_type, destination_type))
       trout_transfer_access_add_tree(access, pair->destination, access->write_filesystems, destination_info);
@@ -962,6 +1122,10 @@ trout_file_transfer_access_destroy(trout_file_transfer_access *access)
 {
   g_hash_table_unref(access->read_filesystems);
   g_hash_table_unref(access->write_filesystems);
+  g_ptr_array_unref(access->read_paths);
+  g_ptr_array_unref(access->write_paths);
+  g_ptr_array_unref(access->rename_paths);
+  g_ptr_array_unref(access->staging_directories);
   g_free(access);
 }
 
@@ -977,13 +1141,96 @@ trout_transfer_access_intersects(GHashTable *first, GHashTable *second)
   return FALSE;
 }
 
-gboolean
-trout_file_transfer_access_conflicts(trout_file_transfer_access *first, trout_file_transfer_access *second)
+static gboolean
+trout_transfer_path_is_within(const char *path, const char *directory)
+{
+  gsize directory_length;
+  if (g_str_equal(path, directory)) return TRUE;
+  if (g_str_equal(directory, "/")) return path[0] == '/';
+  directory_length = strlen(directory);
+  return g_str_has_prefix(path, directory) && path[directory_length] == '/';
+}
+
+static gboolean
+trout_transfer_path_claims_conflict(trout_transfer_path_claim *first, trout_transfer_path_claim *second)
+{
+  return g_str_equal(first->path, second->path) ||
+      (first->recursive && trout_transfer_path_is_within(second->path, first->path)) ||
+      (second->recursive && trout_transfer_path_is_within(first->path, second->path));
+}
+
+static gboolean
+trout_transfer_path_lists_conflict(GPtrArray *first, GPtrArray *second)
+{
+  trout_transfer_path_claim *first_claim;
+  trout_transfer_path_claim *second_claim;
+  guint first_index;
+  guint second_index;
+  for (first_index = 0; first_index < first->len; first_index += 1) {
+    first_claim = g_ptr_array_index(first, first_index);
+    for (second_index = 0; second_index < second->len; second_index += 1) {
+      second_claim = g_ptr_array_index(second, second_index);
+      if (trout_transfer_path_claims_conflict(first_claim, second_claim)) return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+static gboolean
+trout_transfer_rename_conflicts_with_access(trout_file_transfer_access *rename_access, trout_file_transfer_access *other_access)
+{
+  trout_transfer_path_claim *rename_claim;
+  char *parent;
+  char *basename;
+  guint index;
+  if (trout_transfer_path_lists_conflict(rename_access->rename_paths, other_access->read_paths) ||
+      trout_transfer_path_lists_conflict(rename_access->rename_paths, other_access->write_paths)) return TRUE;
+  for (index = 0; index < rename_access->rename_paths->len; index += 1) {
+    rename_claim = g_ptr_array_index(rename_access->rename_paths, index);
+    parent = g_path_get_dirname(rename_claim->path);
+    basename = g_path_get_basename(rename_claim->path);
+    if (g_str_has_prefix(basename, ".trout-transfer-")) {
+      guint staging_index;
+      for (staging_index = 0; staging_index < other_access->staging_directories->len; staging_index += 1) {
+        if (g_str_equal(parent, g_ptr_array_index(other_access->staging_directories, staging_index))) {
+          g_free(parent);
+          g_free(basename);
+          return TRUE;
+        }
+      }
+    }
+    g_free(parent);
+    g_free(basename);
+  }
+  return FALSE;
+}
+
+static gboolean
+trout_transfer_access_path_conflicts(trout_file_transfer_access *first, trout_file_transfer_access *second)
+{
+  if (first->operation == trout_file_operation_rename && second->operation == trout_file_operation_rename)
+    return trout_transfer_path_lists_conflict(first->rename_paths, second->rename_paths);
+  if (first->operation == trout_file_operation_rename)
+    return trout_transfer_rename_conflicts_with_access(first, second);
+  return trout_transfer_rename_conflicts_with_access(second, first);
+}
+
+static gboolean
+trout_transfer_access_filesystem_conflicts(trout_file_transfer_access *first, trout_file_transfer_access *second)
 {
   if (first->exclusive || second->exclusive) return TRUE;
   return trout_transfer_access_intersects(first->read_filesystems, second->write_filesystems) ||
       trout_transfer_access_intersects(first->write_filesystems, second->read_filesystems) ||
       trout_transfer_access_intersects(first->write_filesystems, second->write_filesystems);
+}
+
+gboolean
+trout_file_transfer_access_conflicts(trout_file_transfer_access *first, trout_file_transfer_access *second)
+{
+  if (first->operation == trout_file_operation_rename || second->operation == trout_file_operation_rename) {
+    if (first->paths_complete && second->paths_complete) return trout_transfer_access_path_conflicts(first, second);
+  }
+  return trout_transfer_access_filesystem_conflicts(first, second);
 }
 
 trout_file_transfer_pair *

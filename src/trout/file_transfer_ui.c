@@ -486,21 +486,25 @@ trout_transfer_request_add_queue_row(trout_transfer_request *request)
 {
   GtkWidget *row;
   GtkWidget *label;
+  GtkWidget *action_row;
   GtkWidget *progress;
   GtkWidget *action_button;
-  row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+  row = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+  action_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   label = gtk_label_new(request->summary);
   gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
   gtk_label_set_wrap(GTK_LABEL(label), TRUE);
   gtk_widget_set_hexpand(label, TRUE);
   progress = gtk_progress_bar_new();
   gtk_widget_set_size_request(progress, 90, -1);
+  gtk_widget_set_hexpand(progress, TRUE);
   gtk_widget_set_visible(progress, FALSE);
   action_button = gtk_button_new_with_label("Remove");
   g_signal_connect(action_button, "clicked", G_CALLBACK(trout_transfer_request_remove_queued), request);
   gtk_box_append(GTK_BOX(row), label);
-  gtk_box_append(GTK_BOX(row), progress);
-  gtk_box_append(GTK_BOX(row), action_button);
+  gtk_box_append(GTK_BOX(action_row), progress);
+  gtk_box_append(GTK_BOX(action_row), action_button);
+  gtk_box_append(GTK_BOX(row), action_row);
   gtk_box_append(GTK_BOX(request->window->transfer_queue_list), row);
   request->queue_row = row;
   request->queue_label = label;
@@ -604,6 +608,18 @@ trout_transfer_request_remove_queued(GtkButton *button, gpointer user_data)
   (void)button;
 }
 
+static void
+trout_transfer_scheduler_invalidate_pending(trout_transfer_scheduler *scheduler, trout_transfer_request *completed)
+{
+  GList *link;
+  trout_transfer_request *pending;
+  for (link = scheduler->pending.head; link != 0; link = link->next) {
+    pending = link->data;
+    if (pending->preparing || pending->access == 0 ||
+        trout_file_transfer_access_conflicts(pending->access, completed->access)) pending->access_stale = TRUE;
+  }
+}
+
 void
 trout_transfer_request_finish(trout_transfer_request *request)
 {
@@ -611,6 +627,7 @@ trout_transfer_request_finish(trout_transfer_request *request)
   trout_transfer_scheduler *scheduler;
   window = request->window;
   scheduler = request->scheduler;
+  trout_transfer_scheduler_invalidate_pending(scheduler, request);
   g_ptr_array_remove(scheduler->active, request);
   if (scheduler->collision_owner == request) scheduler->collision_owner = 0;
   request->active = FALSE;
@@ -650,6 +667,8 @@ trout_transfer_scheduler_conflicts_earlier(trout_transfer_scheduler *scheduler, 
   return FALSE;
 }
 
+static void trout_transfer_request_prepare(trout_transfer_request *request);
+
 static void
 trout_transfer_request_start(trout_transfer_request *request)
 {
@@ -681,12 +700,34 @@ trout_transfer_scheduler_schedule(trout_transfer_scheduler *scheduler)
     next = link->next;
     request = link->data;
     if (request->preparing) break;
-    if (request->window->transfer_queue_paused || trout_transfer_scheduler_conflicts_active(scheduler, request) ||
-        trout_transfer_scheduler_conflicts_earlier(scheduler, link, request)) continue;
+    if (request->window->transfer_queue_paused) continue;
+    if (trout_transfer_scheduler_conflicts_active(scheduler, request) ||
+        trout_transfer_scheduler_conflicts_earlier(scheduler, link, request)) {
+      request->access_stale = TRUE;
+      continue;
+    }
+    if (request->access_stale) {
+      request->access_stale = FALSE;
+      g_clear_pointer(&request->access, trout_file_transfer_access_destroy);
+      trout_transfer_request_prepare(request);
+      break;
+    }
     g_queue_delete_link(&scheduler->pending, link);
     g_ptr_array_add(scheduler->active, request);
     trout_transfer_request_start(request);
   }
+}
+
+static void
+trout_transfer_request_prepare(trout_transfer_request *request)
+{
+  GTask *task;
+  request->preparing = TRUE;
+  task = g_task_new(0, request->cancellable, trout_transfer_request_prepared, trout_transfer_request_ref(request));
+  g_task_set_check_cancellable(task, FALSE);
+  g_task_set_task_data(task, request, 0);
+  g_task_run_in_thread(task, trout_transfer_request_prepare_worker);
+  g_object_unref(task);
 }
 
 void
@@ -731,7 +772,6 @@ void
 trout_transfer_request_enqueue(trout_window *window, GPtrArray *operations, trout_file_operation operation)
 {
   trout_transfer_request *request;
-  GTask *task;
   GtkWidget *content;
   GtkWidget *buttons;
   GtkWidget *queue_scroller;
@@ -779,7 +819,6 @@ trout_transfer_request_enqueue(trout_window *window, GPtrArray *operations, trou
     gtk_widget_set_visible(window->transfer_error_label, FALSE);
     queue_scroller = gtk_scrolled_window_new();
     window->transfer_queue_scroller = queue_scroller;
-    gtk_widget_set_size_request(queue_scroller, -1, 150);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(queue_scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     queue_list = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     window->transfer_queue_list = queue_list;
@@ -804,11 +843,7 @@ trout_transfer_request_enqueue(trout_window *window, GPtrArray *operations, trou
   trout_transfer_request_update_queue(window);
   gtk_window_present(GTK_WINDOW(window->transfer_dialog));
   trout_transfer_request_update_window(window);
-  task = g_task_new(0, request->cancellable, trout_transfer_request_prepared, trout_transfer_request_ref(request));
-  g_task_set_check_cancellable(task, FALSE);
-  g_task_set_task_data(task, request, 0);
-  g_task_run_in_thread(task, trout_transfer_request_prepare_worker);
-  g_object_unref(task);
+  trout_transfer_request_prepare(request);
 }
 
 void

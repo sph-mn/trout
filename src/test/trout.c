@@ -184,6 +184,12 @@ trout_test_transfer_access_create(const char *read_filesystem, const char *write
   access = g_new0(trout_file_transfer_access, 1);
   access->read_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
   access->write_filesystems = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 0);
+  access->read_paths = g_ptr_array_new();
+  access->write_paths = g_ptr_array_new();
+  access->rename_paths = g_ptr_array_new();
+  access->staging_directories = g_ptr_array_new();
+  access->paths_complete = TRUE;
+  access->operation = trout_file_operation_copy;
   access->exclusive = exclusive;
   if (read_filesystem != 0) g_hash_table_add(access->read_filesystems, g_strdup(read_filesystem));
   if (write_filesystem != 0) g_hash_table_add(access->write_filesystems, g_strdup(write_filesystem));
@@ -315,6 +321,262 @@ exit:
   g_free(directory);
   g_free(source_path);
   g_free(destination_path);
+  return status;
+}
+
+static trout_file_transfer_access *
+trout_test_transfer_access_from_pair(trout_file_transfer_pair *pair, trout_file_operation operation)
+{
+  GPtrArray *operations;
+  trout_file_transfer_access *access;
+  operations = g_ptr_array_new_with_free_func(trout_file_transfer_pair_destroy);
+  g_ptr_array_add(operations, pair);
+  access = trout_file_transfer_access_new(operations, operation);
+  g_ptr_array_unref(operations);
+  return access;
+}
+
+trout_test_status_t
+trout_test_transfer_access_path_conflicts(void)
+{
+  trout_test_status_t status = {0};
+  char *directory;
+  char *source_path;
+  char *a_path;
+  char *b_path;
+  char *c_path;
+  char *bb_path;
+  char *target_path;
+  char *source_directory_path;
+  char *source_child_path;
+  char *target_child_path;
+  char *staging_target_path;
+  char *staging_source_path;
+  char *alias_path;
+  char *alias_target_path;
+  GFile *source;
+  GFile *a_file;
+  GFile *b_file;
+  GFile *c_file;
+  GFile *bb_file;
+  GFile *target_file;
+  GFile *source_directory;
+  GFile *source_child;
+  GFile *target_child;
+  GFile *staging_target;
+  GFile *staging_source;
+  GFile *alias_target;
+  GFile *root_file;
+  trout_file_transfer_access *copy_access;
+  trout_file_transfer_access *directory_copy_access;
+  trout_file_transfer_access *rename_access;
+  trout_file_transfer_pair *pair;
+  trout_transfer_scheduler scheduler = {0};
+  trout_transfer_request active_request = {0};
+  trout_transfer_request queued_request = {0};
+  GError *error;
+  status.group = "";
+  directory = 0;
+  source_path = 0;
+  a_path = 0;
+  b_path = 0;
+  c_path = 0;
+  bb_path = 0;
+  target_path = 0;
+  source_directory_path = 0;
+  source_child_path = 0;
+  target_child_path = 0;
+  staging_target_path = 0;
+  staging_source_path = 0;
+  alias_path = 0;
+  alias_target_path = 0;
+  source = 0;
+  a_file = 0;
+  b_file = 0;
+  c_file = 0;
+  bb_file = 0;
+  target_file = 0;
+  source_directory = 0;
+  source_child = 0;
+  target_child = 0;
+  staging_target = 0;
+  staging_source = 0;
+  alias_target = 0;
+  root_file = 0;
+  copy_access = 0;
+  directory_copy_access = 0;
+  rename_access = 0;
+  pair = 0;
+  scheduler.active = g_ptr_array_new();
+  error = 0;
+  directory = g_dir_make_tmp("trout-access-path-test-XXXXXX", &error);
+  test_helper_assert("temporary directory created", directory != 0);
+  source_path = g_build_filename(directory, "source", (char *)0);
+  a_path = g_build_filename(directory, "a", (char *)0);
+  b_path = g_build_filename(a_path, "b", (char *)0);
+  c_path = g_build_filename(a_path, "c", (char *)0);
+  bb_path = g_build_filename(a_path, "bb", (char *)0);
+  target_path = g_build_filename(b_path, "target", (char *)0);
+  source_directory_path = g_build_filename(directory, "source-directory", (char *)0);
+  source_child_path = g_build_filename(source_directory_path, "child", (char *)0);
+  target_child_path = g_build_filename(b_path, "target-child", (char *)0);
+  staging_target_path = g_build_filename(a_path, "staging-target", (char *)0);
+  staging_source_path = g_build_filename(a_path, ".trout-transfer-probe", (char *)0);
+  alias_path = g_build_filename(directory, "alias", (char *)0);
+  alias_target_path = g_build_filename(alias_path, "alias-target", (char *)0);
+  test_helper_assert("test directories created", g_mkdir_with_parents(b_path, 0700) == 0 &&
+      g_mkdir_with_parents(c_path, 0700) == 0 && g_mkdir_with_parents(bb_path, 0700) == 0 &&
+      g_mkdir_with_parents(source_directory_path, 0700) == 0);
+  test_helper_assert("test files created", g_file_set_contents(source_path, "source", -1, &error) &&
+      g_file_set_contents(target_path, "target", -1, &error) &&
+      g_file_set_contents(source_child_path, "child", -1, &error) &&
+      g_file_set_contents(target_child_path, "target-child", -1, &error) &&
+      g_file_set_contents(staging_source_path, "staging", -1, &error));
+  test_helper_assert("directory alias created", symlink(a_path, alias_path) == 0);
+  source = g_file_new_for_path(source_path);
+  a_file = g_file_new_for_path(a_path);
+  b_file = g_file_new_for_path(b_path);
+  c_file = g_file_new_for_path(c_path);
+  bb_file = g_file_new_for_path(bb_path);
+  target_file = g_file_new_for_path(target_path);
+  source_directory = g_file_new_for_path(source_directory_path);
+  source_child = g_file_new_for_path(source_child_path);
+  target_child = g_file_new_for_path(target_child_path);
+  staging_target = g_file_new_for_path(staging_target_path);
+  staging_source = g_file_new_for_path(staging_source_path);
+  alias_target = g_file_new_for_path(alias_target_path);
+  pair = trout_file_transfer_pair_new(source, target_file);
+  copy_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_copy);
+  pair = 0;
+  pair = trout_file_transfer_pair_new_rename(c_file, "renamed-c", &error);
+  test_helper_assert("sibling rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  test_helper_assert("local path claims are available", copy_access->read_paths->len > 0 &&
+      copy_access->write_paths->len > 0 && rename_access->rename_paths->len == 2);
+  if (!copy_access->paths_complete || !rename_access->paths_complete)
+    test_helper_assert("mountpoint paths use filesystem fallback", trout_file_transfer_access_conflicts(copy_access, rename_access));
+  /* Test path comparison separately from this host's mountpoint fallback. */
+  copy_access->paths_complete = TRUE;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("sibling rename and write can run concurrently", !trout_file_transfer_access_conflicts(copy_access, rename_access));
+  active_request.access = copy_access;
+  queued_request.access = rename_access;
+  g_ptr_array_add(scheduler.active, &active_request);
+  test_helper_assert("scheduler admits an independent rename", !trout_transfer_scheduler_conflicts_active(&scheduler, &queued_request));
+  g_ptr_array_set_size(scheduler.active, 0);
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new_rename(bb_file, "renamed-bb", &error);
+  test_helper_assert("component-prefix rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("component-prefix paths stay distinct", !trout_file_transfer_access_conflicts(copy_access, rename_access));
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new_rename(a_file, "renamed-a", &error);
+  test_helper_assert("ancestor rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("ancestor rename conflicts with nested write", trout_file_transfer_access_conflicts(copy_access, rename_access));
+  queued_request.access = rename_access;
+  g_ptr_array_add(scheduler.active, &active_request);
+  test_helper_assert("scheduler blocks an overlapping rename", trout_transfer_scheduler_conflicts_active(&scheduler, &queued_request));
+  g_ptr_array_set_size(scheduler.active, 0);
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new_rename(source, "renamed-source", &error);
+  test_helper_assert("source rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("rename of the read source conflicts", trout_file_transfer_access_conflicts(copy_access, rename_access));
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new_rename(target_file, "renamed-target", &error);
+  test_helper_assert("exact-path rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("rename of the written path conflicts", trout_file_transfer_access_conflicts(copy_access, rename_access));
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new(source_directory, b_file);
+  directory_copy_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_copy);
+  pair = 0;
+  directory_copy_access->paths_complete = TRUE;
+  pair = trout_file_transfer_pair_new_rename(source_child, "renamed-child", &error);
+  test_helper_assert("nested rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("rename inside merged directory conflicts", trout_file_transfer_access_conflicts(directory_copy_access, rename_access));
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new_rename(target_child, "renamed-target-child", &error);
+  test_helper_assert("merged target rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("rename inside merge destination conflicts", trout_file_transfer_access_conflicts(directory_copy_access, rename_access));
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&directory_copy_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&copy_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new(source, staging_target);
+  copy_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_copy);
+  pair = 0;
+  copy_access->paths_complete = TRUE;
+  pair = trout_file_transfer_pair_new_rename(staging_source, "renamed-probe", &error);
+  test_helper_assert("staging-name rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  rename_access->paths_complete = TRUE;
+  test_helper_assert("rename of a reserved staging name conflicts", trout_file_transfer_access_conflicts(copy_access, rename_access));
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&copy_access, trout_file_transfer_access_destroy);
+  pair = trout_file_transfer_pair_new(source, alias_target);
+  copy_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_copy);
+  pair = 0;
+  pair = trout_file_transfer_pair_new_rename(c_file, "renamed-c", &error);
+  test_helper_assert("symlink-alias rename profile created", pair != 0);
+  rename_access = trout_test_transfer_access_from_pair(pair, trout_file_operation_rename);
+  pair = 0;
+  test_helper_assert("symlinked parent uses conservative filesystem conflict", !copy_access->paths_complete &&
+      trout_file_transfer_access_conflicts(copy_access, rename_access));
+exit:
+  g_clear_error(&error);
+  if (directory != 0) {
+    root_file = g_file_new_for_path(directory);
+    trout_test_delete_tree(root_file, &error);
+    g_clear_error(&error);
+  }
+  g_clear_object(&root_file);
+  g_clear_object(&source);
+  g_clear_object(&a_file);
+  g_clear_object(&b_file);
+  g_clear_object(&c_file);
+  g_clear_object(&bb_file);
+  g_clear_object(&target_file);
+  g_clear_object(&source_directory);
+  g_clear_object(&source_child);
+  g_clear_object(&target_child);
+  g_clear_object(&staging_target);
+  g_clear_object(&staging_source);
+  g_clear_object(&alias_target);
+  g_clear_pointer(&copy_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&directory_copy_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&rename_access, trout_file_transfer_access_destroy);
+  g_clear_pointer(&scheduler.active, g_ptr_array_unref);
+  g_free(directory);
+  g_free(source_path);
+  g_free(a_path);
+  g_free(b_path);
+  g_free(c_path);
+  g_free(bb_path);
+  g_free(target_path);
+  g_free(source_directory_path);
+  g_free(source_child_path);
+  g_free(target_child_path);
+  g_free(staging_target_path);
+  g_free(staging_source_path);
+  g_free(alias_path);
+  g_free(alias_target_path);
   return status;
 }
 
@@ -1471,6 +1733,7 @@ main(void)
   test_helper_test(trout_test_transfer_merge_policy);
   test_helper_test(trout_test_transfer_access_conflicts);
   test_helper_test(trout_test_transfer_access_profiles);
+  test_helper_test(trout_test_transfer_access_path_conflicts);
   test_helper_test(trout_test_file_delete_tree);
   test_helper_test(trout_test_file_transfer_merges_directories);
   test_helper_test(trout_test_file_transfer_replace_and_cancel);

@@ -31,6 +31,12 @@ typedef struct trout_file_transfer_access trout_file_transfer_access;
 struct trout_file_transfer_access {
   GHashTable *read_filesystems;
   GHashTable *write_filesystems;
+  GPtrArray *read_paths;
+  GPtrArray *write_paths;
+  GPtrArray *rename_paths;
+  GPtrArray *staging_directories;
+  trout_file_operation operation;
+  gboolean paths_complete;
   gboolean exclusive;
 };
 
